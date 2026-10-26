@@ -1,0 +1,17 @@
+.git
+.idea
+.vscode
+.env
+.env.*
+!.env.example
+.venv*
+venv
+.wheel-check
+__pycache__
+*.pyc
+.pytest_cache
+data
+logs
+*.log
+*.sqlite*
+*.db

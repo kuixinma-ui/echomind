@@ -1,0 +1,36 @@
+# Local secrets: only sanitized examples belong in Git.
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+
+# Runtime data and generated results
+data/
+logs/
+*.log
+*.sqlite*
+*.db
+
+# Dependencies and builds
+.venv*/
+venv/
+.wheel-check/
+node_modules/
+dist/
+build/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.bak
