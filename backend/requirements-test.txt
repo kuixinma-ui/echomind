@@ -1,0 +1,12 @@
+# Match runtime pins; exclude Chroma/ONNX and uvicorn extras for offline tests.
+# Do not use requirements.txt as a constraint: pip rejects its [standard] extra.
+pytest==8.3.5
+anthropic==0.40.0
+fastapi==0.115.5
+pydantic==2.10.3
+httpx==0.28.1
+uvicorn==0.32.1
+python-dotenv==1.0.1
+prometheus-client==0.21.1
+python-multipart==0.0.12
+redis==5.2.1

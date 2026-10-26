@@ -55,17 +55,18 @@ VITE_PYTHON_API_URL=http://localhost:8000
 在 `backend/` 的虚拟环境中：
 
 ```bash
-python -m pip install pytest==8.3.5
+python -m pip install -r requirements-test.txt
 python -m pytest tests -q
 ```
 
-现有 9 个测试检查 Agent 角色差异、人工交接、回复合并降级、工具隔离、参数校验和工具调用循环。它们不验证真实模型质量、Redis/ChromaDB 连接或完整部署。
+离线测试覆盖 Agent、工具轨迹、完整对话服务、隔离回放、评分与报告、上下文版本和记忆差异。它们不验证真实模型质量、Redis/ChromaDB 连接或完整部署；数据校验、live 回放和观测配置见[场景评测指南](evaluation.md)。
 
 前端构建验证：
 
 ```bash
 cd frontend
 npm ci
+npm test
 npm run build
 ```
 

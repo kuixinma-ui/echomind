@@ -1,0 +1,39 @@
+{
+  "date": "2026-10-26",
+  "handoff_state": "stopped_before_candidate_full_live_run",
+  "backend_tests": {
+    "tests": 301,
+    "errors": 0,
+    "failures": 0,
+    "skipped": 0
+  },
+  "frontend_tests": 3,
+  "frontend_build": "passed",
+  "candidate_live_replay_executed": false,
+  "original_smoke_live": {
+    "first_run": "f5d4b331035144f2a9a2875e977ef91b",
+    "first_passed": 1,
+    "first_invalid": 2,
+    "latest_run": "f9e8f35ed49c48868a99d98e89c0b401",
+    "latest_passed": 3,
+    "latest_invalid": 0
+  },
+  "baseline_promoted": false,
+  "local_service_state": "stopped_volumes_preserved",
+  "not_exported": [
+    "credentials",
+    ".env files",
+    "databases",
+    "installers",
+    "venv",
+    "node_modules",
+    "model cache",
+    "raw machine logs"
+  ],
+  "clean_committed_checkout_backend_tests": {
+    "tests": 301,
+    "errors": 0,
+    "failures": 0,
+    "skipped": 0
+  }
+}

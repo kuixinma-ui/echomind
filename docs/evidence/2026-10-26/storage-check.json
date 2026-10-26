@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "run_id": "integration_8d5f3505b2ce4f28b8536de2e6f11cbf",
+  "timestamp": "2026-10-26T09:22:14.346257+00:00",
+  "stage": "storage",
+  "full_integration_verified": false,
+  "model_requests": 0,
+  "checks": [
+    {
+      "id": "configuration",
+      "status": "passed",
+      "evidence": "offline_inventory",
+      "packages": {
+        "anthropic": "0.40.0",
+        "redis": "5.2.1",
+        "chromadb": "0.5.23",
+        "langfuse": "5.0.4",
+        "httpx": "0.28.1",
+        "pydantic": "2.10.3"
+      },
+      "configured": {
+        "ANTHROPIC_API_KEY": false,
+        "ANTHROPIC_BASE_URL": true,
+        "ANTHROPIC_MODEL": false,
+        "REDIS_URL": true,
+        "CHROMA_HOST": true,
+        "CHROMA_PORT": true,
+        "LANGFUSE_PUBLIC_KEY": false,
+        "LANGFUSE_SECRET_KEY": false,
+        "LANGFUSE_BASE_URL": true
+      },
+      "network_accessed": false
+    },
+    {
+      "id": "redis",
+      "evidence": "redis_wire_protocol",
+      "namespace": "eval_dcafd00d08a34f4ab8056b1c77222f22",
+      "server_identity": "unverified_redis_compatible",
+      "status": "passed",
+      "server_version": "7.4.2",
+      "ttl_seconds": 60,
+      "checks": [
+        "ping",
+        "list_roundtrip",
+        "server_ttl",
+        "owned_key_isolation"
+      ],
+      "cleanup": "passed"
+    },
+    {
+      "id": "chroma",
+      "evidence": "real_http_service",
+      "collection": "eval_f19d0617d92645b5bf67a7316a9e2ad2_integration",
+      "embedding": "explicit_test_vectors",
+      "default_embedding_verified": false,
+      "status": "passed",
+      "server_version": "0.5.23",
+      "checks": [
+        "heartbeat",
+        "version",
+        "create",
+        "explicit_vector_add",
+        "filtered_query"
+      ],
+      "cleanup": "passed"
+    }
+  ],
+  "status": "passed"
+}

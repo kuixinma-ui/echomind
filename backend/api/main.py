@@ -11,7 +11,7 @@ import pathlib
 import sys
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Literal
 
 
 _ROOT = str(pathlib.Path(__file__).parent.parent.resolve())
@@ -49,6 +49,8 @@ _tool_manager = None
 _monitor      = None
 _evaluator    = None
 _skill_manager = None
+_chat_service = None
+_runtime = None
 
 def _anthropic_cfg() -> Dict[str, Any]:
     key = os.getenv("ANTHROPIC_API_KEY", "")
@@ -66,126 +68,51 @@ def _anthropic_cfg() -> Dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager
+    global _orchestrator, _memory, _tool_manager, _monitor, _skill_manager, _chat_service, _runtime
+    from monitor.performance_monitor import PerformanceMonitor
+    from observability.telemetry import get_telemetry
+    from services.runtime import create_runtime, runtime_config_from_env
 
     print(BANNER, flush=True)
+    if os.getenv('ECHOMIND_EVALUATION_ONLY', 'false').lower() == 'true':
+        logger.info('Evaluation-only mode: live conversation components are disabled')
+        yield
+        return
+    _anthropic_cfg()  # Validate the live provider configuration without logging it.
+    telemetry = get_telemetry()
+    _runtime = await create_runtime(runtime_config_from_env(), telemetry=telemetry)
+    _orchestrator, _memory = _runtime.orchestrator, _runtime.memory
+    _tool_manager, _skill_manager = _runtime.tool_manager, _runtime.skills
+    _chat_service = _runtime.service
+    try:
+        _monitor = PerformanceMonitor(
+            orchestrator=_orchestrator, tool_manager=_tool_manager,
+            interval_s=float(os.getenv("MONITOR_INTERVAL", "10")),
+            webhook_url=os.getenv("ALERT_WEBHOOK_URL") or None,
+            prometheus_port=int(os.getenv("PROMETHEUS_PORT", "0")) or None,
+        )
+        await _monitor.start()
+        logger.info("EchoMind ready")
+        yield
+    finally:
+        try:
+            if _monitor is not None:
+                await _monitor.stop()
+        finally:
+            try:
+                await _runtime.close()
+            finally:
+                telemetry.shutdown()
+                _chat_service = None
 
-    from agents.agent_orchestrator import AgentOrchestrator, Request, build_shared_rag_tools
-    from core.intent_recognizer import IntentRecognizer
-    from evaluation.evaluator import EndToEndEvaluator
-    from mcp.knowledge_base import KnowledgeBase
-    from mcp.tool_manager import MCPToolManager, Tool
-    from memory.conversation_memory import MemoryManager
-    from monitor.performance_monitor import PerformanceMonitor
-    from core.skill_loader import SkillManager
 
-    cfg = _anthropic_cfg()
-    logger.info(f"模型: {cfg['model']}  base_url: {cfg.get('base_url', '(官方)')}")
-
-    # 意图识别器（Orchestrator 内部也会创建，这里单独暴露给 Evaluator）
-    recognizer = IntentRecognizer(
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
+async def _isolated_runtime(*, namespace, knowledge_documents=None):
+    from observability.telemetry import get_telemetry
+    from services.runtime import create_runtime, runtime_config_from_env
+    return await create_runtime(
+        runtime_config_from_env(), namespace=namespace,
+        knowledge_documents=knowledge_documents or [], telemetry=get_telemetry(),
     )
-
-    # Skills：启动时从目录加载业务能力说明，并在 Agent 调用 LLM 时动态注入。
-    skills_dir = os.getenv("ECHOMIND_SKILLS_DIR", str(pathlib.Path(_ROOT) / "skills"))
-    _skill_manager = SkillManager(
-        root_dir=skills_dir,
-        max_prompt_chars=int(os.getenv("ECHOMIND_SKILLS_MAX_PROMPT_CHARS", "5000")),
-    )
-    _skill_manager.load()
-
-    # Agent 编排器
-    _orchestrator = AgentOrchestrator(
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
-        skill_manager=_skill_manager,
-    )
-
-    # 记忆管理器（Redis 工作记忆 + ChromaDB 情景记忆/用户画像）
-    _memory = MemoryManager(
-        redis_url=os.getenv("REDIS_URL", "redis://redis:6379/0"),
-        chroma_host=os.getenv("CHROMA_HOST", "chromadb"),
-        chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
-        chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
-    )
-
-    # MCP 工具管理器 + RAG 知识库（基于 ChromaDB 的真实检索）
-    _tool_manager = MCPToolManager(
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
-    )
-    kb = KnowledgeBase(
-        chroma_host=os.getenv("CHROMA_HOST", "chromadb"),
-        chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
-        chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
-    )
-    logger.info(f"知识库已加载: {await kb.doc_count_async()} 个文档片段")
-
-    def knowledge_fallback(params: Dict[str, Any], context: Optional[Dict[str, Any]], error: str):
-        query = params.get("query", "")
-        return [{
-            "title": "知识库降级结果",
-            "content": f"知识库暂时不可用，未能完成对“{query}”的语义检索。请稍后重试，或转人工客服确认。",
-            "score": 0.0,
-            "fallback": True,
-            "error": error,
-        }]
-
-    _tool_manager.register(Tool(
-        name="knowledge_search",
-        description="搜索知识库（基于 ChromaDB 向量检索）",
-        handler=kb.search_handler,
-        schema={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "top_k": {"type": "integer"},
-            },
-            "required": ["query"],
-        },
-        cache_ttl=300.0,
-        supports_rerank=True,
-        fallback=knowledge_fallback,
-    ))
-    if _orchestrator is not None:
-        _orchestrator.set_shared_tools(build_shared_rag_tools(_tool_manager))
-
-    # 性能监控（可选启动 Prometheus）
-    prom_port = int(os.getenv("PROMETHEUS_PORT", "0")) or None
-    _monitor = PerformanceMonitor(
-        orchestrator=_orchestrator,
-        tool_manager=_tool_manager,
-        interval_s=float(os.getenv("MONITOR_INTERVAL", "10")),
-        webhook_url=os.getenv("ALERT_WEBHOOK_URL") or None,
-        prometheus_port=prom_port,
-    )
-    await _monitor.start()
-
-    # 评测器
-    _evaluator = EndToEndEvaluator(
-        orchestrator=_orchestrator,
-        recognizer=recognizer,
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
-        baseline_path=os.getenv("EVAL_BASELINE_PATH", "/app/data/eval/baseline.json"),
-    )
-
-    logger.info("EchoMind 已就绪")
-    yield
-
-    await _monitor.stop()
-    if _memory is not None:
-        await _memory.close()
-    logger.info("EchoMind 已关闭")
 
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
@@ -230,6 +157,13 @@ class ChatResponse(BaseModel):
     entities: Dict[str, List[str]] = Field(default_factory=dict)
     intent_confidence: float = 0.0
     intent_source_scores: Dict[str, float] = Field(default_factory=dict)
+    orchestrator_latency_ms: float = 0.0
+    stage_latency_ms: Dict[str, float] = Field(default_factory=dict)
+    tool_traces: List[Dict[str, Any]] = Field(default_factory=list)
+    profile_status: str = "scheduled"
+    usage: Dict[str, int] = Field(default_factory=dict)
+    usage_scope: str = "through_response"
+    memory_evidence_ids: List[str] = Field(default_factory=list)
 
 
 class ToolTraceResponse(BaseModel):
@@ -275,69 +209,12 @@ async def chat(req: ChatRequest):
     主对话接口。完整流程：
       记忆读取 → 意图识别 → Agent 路由 → 执行 → 记忆写入
     """
-    if _orchestrator is None or _memory is None:
+    if _chat_service is None:
         raise HTTPException(503, "服务未就绪")
-
-    from agents.agent_orchestrator import Request as OrcReq
-    from memory.conversation_memory import MsgRole
-
-    conv_id = req.conv_id or str(uuid.uuid4())
-
-    # 1. 读取记忆上下文
-    mem_ctx = await _memory.get_context(req.user_id, conv_id, query=req.message)
-
-    # 2. 构建编排请求（含对话历史，用于意图识别上下文）
-    history = [
-        {"role": m.role.value, "content": m.content}
-        for m in mem_ctx.recent_messages[-5:]
-    ] if mem_ctx.recent_messages else None
-
-    intent_result = await _orchestrator.recognize_intent(req.message, history=history)
-    full_context = mem_ctx.to_prompt_text()
-
-    orch_req = OrcReq(
-        message=req.message,
-        user_id=req.user_id,
-        conv_id=conv_id,
-        context=full_context,
-        history=history,
-        entities=intent_result.entities,
-        intent=intent_result.intent,
-        intent_group=intent_result.intent_group,
-        urgency=intent_result.urgency,
-        intent_confidence=intent_result.confidence,
-    )
-
-    # 3. 执行
-    result = await _orchestrator.run(orch_req)
-
-    # 4. 写入记忆
-    await _memory.add_message(req.user_id, conv_id, MsgRole.USER, req.message)
-    await _memory.add_message(req.user_id, conv_id, MsgRole.ASSISTANT, result.response)
-
-    # 5. 异步更新用户画像（不阻塞响应）
-    asyncio.create_task(_memory.update_profile(req.user_id, conv_id))
-
-    return ChatResponse(
-        conv_id=conv_id,
-        request_id=result.request_id,
-        response=result.response,
-        intent=result.intent.value if result.intent else "other",
-        intent_group=intent_result.intent_group,
-        agent_type=result.agent_type.value,
-        agent_types=[agent_type.value for agent_type in result.agent_types],
-        primary_agent=result.primary_agent.value if result.primary_agent else result.agent_type.value,
-        supporting_agents=[agent_type.value for agent_type in result.supporting_agents],
-        tools_used=result.tools_used,
-        routing_reason=result.routing_reason,
-        routing_confidence=result.routing_confidence,
-        escalated=result.escalated,
-        latency_ms=round(result.latency_ms, 1),
-        knowledge_used="search_knowledge_base" in result.tools_used,
-        entities=intent_result.entities,
-        intent_confidence=round(intent_result.confidence, 4),
-        intent_source_scores=intent_result.source_scores,
-    )
+    try:
+        return await _chat_service.chat(req.message, req.user_id, req.conv_id)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 async def _build_knowledge_context(message: str, intent=None, top_k: int = 3) -> tuple[str, bool]:
@@ -564,53 +441,146 @@ async def knowledge_stats():
 
 @app.post("/eval/run")
 async def run_eval(body: Optional[EvalRunInput] = None):
-    """运行内置评测用例，返回评测报告。"""
-    if _evaluator is None:
+    """Explicit live legacy evaluation, isolated from online conversation state."""
+    if _chat_service is None:
         raise HTTPException(503, "服务未就绪")
-    from evaluation.evaluator import DEFAULT_DIALOG_CASES, DEFAULT_INTENT_CASES, IntentTestCase
+    from dataclasses import asdict
+    from evaluation.evaluator import DEFAULT_DIALOG_CASES, DEFAULT_INTENT_CASES, IntentTestCase, EndToEndEvaluator
 
-    if body and body.intent_cases is not None:
-        intent_cases = [
-            IntentTestCase(
-                message=c.message,
-                expected_intent=c.expected_intent,
-                context=c.context,
-            )
-            for c in body.intent_cases
-        ]
-    else:
-        intent_cases = DEFAULT_INTENT_CASES
+    intent_cases = [IntentTestCase(**case.model_dump()) for case in body.intent_cases] if body and body.intent_cases is not None else DEFAULT_INTENT_CASES
+    dialog_cases = [case.model_dump(exclude_none=True) for case in body.dialog_cases] if body and body.dialog_cases is not None else DEFAULT_DIALOG_CASES
+    run_id = uuid.uuid4().hex
+    runtime = await _isolated_runtime(namespace=f"eval_{run_id}")
+    evaluator = None
+    try:
+        cfg = _anthropic_cfg()
+        evaluator = EndToEndEvaluator(
+            orchestrator=runtime.orchestrator, recognizer=runtime.recognizer,
+            chat_service=runtime.service, **cfg,
+            baseline_path=os.getenv("EVAL_BASELINE_PATH", "/app/data/eval/baseline.json"),
+        )
+        report = await evaluator.run(intent_cases=intent_cases, dialog_cases=dialog_cases, metadata={"run_id": run_id})
+        return {key: getattr(report, key) for key in (
+            "pass_rate", "total", "passed", "avg_scores", "regressions", "recommendations",
+            "run_id", "metadata", "invalid", "valid_count",
+        )} | {"results": [asdict(result) for result in report.results]}
+    finally:
+        try:
+            client = getattr(getattr(evaluator, '_judge', None), '_client', None)
+            if client is not None:
+                await client.close()
+        finally:
+            await runtime.close(cleanup=True)
 
-    if body and body.dialog_cases is not None:
-        dialog_cases = [
-            c.model_dump(exclude_none=True)
-            for c in body.dialog_cases
-        ]
-    else:
-        dialog_cases = DEFAULT_DIALOG_CASES
 
-    report = await _evaluator.run(
-        intent_cases=intent_cases,
-        dialog_cases=dialog_cases,
-    )
-    return {
-        "pass_rate":       report.pass_rate,
-        "total":           report.total,
-        "passed":          report.passed,
-        "avg_scores":      report.avg_scores,
-        "regressions":     report.regressions,
-        "recommendations": report.recommendations,
-        "results": [
-            {
-                "test_id": r.test_id,
-                "passed": r.passed,
-                "scores": r.scores,
-                "detail": r.detail,
-                "metadata": r.metadata,
-            }
-            for r in report.results
-        ],
+class ScenarioRunInput(BaseModel):
+    mode: Literal['validate', 'live'] = 'validate'
+    scenario: Optional[str] = None
+    limit: int = Field(default=5, ge=1, le=120)
+    model_config = {'extra': 'forbid'}
+
+
+class CompareRunInput(BaseModel):
+    left_run_id: str = Field(min_length=1, max_length=128)
+    right_run_id: str = Field(min_length=1, max_length=128)
+    vary: List[Literal['model', 'prompt', 'skills', 'code', 'retrieval']] = Field(default_factory=list)
+    model_config = {'extra': 'forbid'}
+
+
+def _scenario_dataset():
+    from evaluation.scenarios import load_dataset
+    return load_dataset()
+
+
+def _report_store():
+    from evaluation.report_store import ReportStore
+    return ReportStore(os.getenv('ECHOMIND_EVAL_REPORT_DIR', str(pathlib.Path(_ROOT) / 'data/eval/scenarios')))
+
+
+@app.get('/eval/scenarios')
+async def scenario_catalog():
+    from evaluation.scenarios import validate_dataset
+    dataset = _scenario_dataset()
+    summary = validate_dataset(dataset)
+    groups = {}
+    for case in dataset['cases']:
+        groups[case['scenario']] = groups.get(case['scenario'], 0) + 1
+    return {key: dataset[key] for key in ('id', 'version', 'status')} | {
+        'summary': {**summary, 'cases': len(dataset['cases']), 'by_scenario': groups},
+        'cases': [{'id': case['id'], 'scenario': case['scenario'], 'description': case['description'],
+                   'turns': len(case['turns'])} for case in dataset['cases']],
     }
+
+
+@app.post('/eval/scenarios/run')
+async def run_scenarios(body: Optional[ScenarioRunInput] = None):
+    import copy
+    from datetime import datetime, timezone
+    from evaluation.scenarios import validate_dataset, build_fingerprints
+    from evaluation.scenario_runner import ScenarioRunner
+    from services.runtime import runtime_config_from_env
+    from observability.telemetry import get_telemetry
+
+    options = body or ScenarioRunInput()
+    dataset = copy.deepcopy(_scenario_dataset())
+    if options.scenario:
+        dataset['cases'] = [case for case in dataset['cases'] if case['scenario'] == options.scenario]
+        if not dataset['cases']:
+            raise HTTPException(422, 'Unknown scenario')
+    if options.mode == 'live':
+        dataset['cases'] = dataset['cases'][:options.limit]
+    summary = validate_dataset(dataset)
+    config = runtime_config_from_env()
+    config['judge_enabled'] = options.mode == 'live'
+    metadata = {'mode': options.mode, 'fingerprints': build_fingerprints(dataset, config)}
+    if options.mode == 'validate':
+        report = {'run_id': uuid.uuid4().hex, 'timestamp': datetime.now(timezone.utc).isoformat(),
+                  'dataset': {key: dataset[key] for key in ('id', 'version', 'status')},
+                  'mode': 'validate', 'status': 'validated', 'metadata': metadata,
+                  'total': 0, 'passed': 0, 'pass_rate': None, 'invalid': 0, 'timeout': 0,
+                  'error': 0, 'hard_fail': 0, 'cases': [], 'validation': summary}
+    else:
+        try:
+            _anthropic_cfg()
+        except RuntimeError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        from evaluation.evaluator import LLMJudge
+        from anthropic import AsyncAnthropic
+        cfg = _anthropic_cfg()
+        from observability.instrumentation import AnthropicClientProxy
+        judge_client = AnthropicClientProxy(AsyncAnthropic(**{key: cfg[key] for key in ('api_key', 'base_url') if cfg.get(key)}))
+        try:
+            runner = ScenarioRunner(_isolated_runtime, judge=LLMJudge(judge_client, config['judge_model']), telemetry=get_telemetry())
+            report = await runner.run(dataset, metadata=metadata)
+        finally:
+            await judge_client.close()
+    await asyncio.to_thread(_report_store().save, report)
+    return report
+
+
+@app.get('/eval/runs')
+async def list_eval_runs():
+    return {'items': await asyncio.to_thread(_report_store().list)}
+
+
+@app.get('/eval/runs/{run_id}')
+async def get_eval_run(run_id: str):
+    try:
+        return await asyncio.to_thread(_report_store().load, run_id)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(404, 'Unknown evaluation run') from exc
+
+
+@app.post('/eval/compare')
+async def compare_eval_runs(body: CompareRunInput):
+    try:
+        return await asyncio.to_thread(_report_store().compare, body.left_run_id, body.right_run_id, vary=body.vary)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(404, 'Unknown evaluation run') from exc
 
 
 # ── 交互式 CLI ────────────────────────────────────────────────────────────────

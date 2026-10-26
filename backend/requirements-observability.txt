@@ -1,0 +1,3 @@
+# Optional exporter, separate from the application's Anthropic dependencies.
+# Verified on PyPI 2026-10-26. Requires Python >=3.11 and Langfuse Cloud or >=4.59.0.
+langfuse==5.0.4

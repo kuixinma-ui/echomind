@@ -1,0 +1,11 @@
+# Optional, local test project only; no user account or external identity.
+# Pair with compose.integration.yml and the langfuse profile.
+services:
+  langfuse-web:
+    environment:
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:?Prepare local headless configuration}
+      LANGFUSE_INIT_ORG_NAME: EchoMind local evaluation
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:?Prepare local headless configuration}
+      LANGFUSE_INIT_PROJECT_NAME: EchoMind synthetic integration
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:?Prepare local project key}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:?Prepare local project key}

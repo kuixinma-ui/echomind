@@ -12,11 +12,12 @@ ChromaDB 在这里的角色：
   两者是不同的 collection，互不干扰。
 """
 import asyncio
-import hashlib
 import logging
 from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
 
-import chromadb
+from context import ContextRef, effective_time, version_key
+from services.storage import create_chroma_client, require_evaluation_namespace
 
 logger = logging.getLogger(__name__)
 
@@ -37,40 +38,36 @@ class KnowledgeBase:
         chroma_host: str = "localhost",
         chroma_port: int = 8000,
         chroma_path: str = "./data/chroma",
+        *,
+        collection_name: str = COLLECTION_NAME,
+        seed_default: bool = True,
+        chroma_client=None,
+        chroma_mode: str = 'auto',
     ):
-        # 优先连接独立 ChromaDB 服务（服务端内置 embedding 模型，客户端无需下载）
-        self._use_server = False
-        try:
-            # HttpClient 默认也会初始化 ChromaDB telemetry；显式关闭避免 posthog 兼容性错误日志。
-            self._client = chromadb.HttpClient(
-                host=chroma_host,
-                port=chroma_port,
-                settings=chromadb.Settings(anonymized_telemetry=False),
-            )
-            self._client.heartbeat()
-            self._use_server = True
-            logger.info(f"知识库 ChromaDB 已连接: {chroma_host}:{chroma_port}")
-        except Exception:
-            logger.info(f"知识库 ChromaDB 服务不可用，使用本地模式: {chroma_path}")
-            self._client = chromadb.PersistentClient(
-                path=chroma_path,
-                settings=chromadb.Settings(anonymized_telemetry=False),
-            )
+        # 0.5.23 默认 embedding 在 Python 调用端计算；HTTP 模式也需可用的ONNX缓存。
+        self._client = chroma_client if chroma_client is not None else create_chroma_client(chroma_host, chroma_port, chroma_path, mode=chroma_mode)
+        self.collection_name = collection_name
 
-        # 使用服务端时不传 embedding_function，让服务端处理
-        # 本地模式时也不传，使用 ChromaDB 默认的（会触发模型下载）
+        # 默认EF首次实际add/query可能下载模型；heartbeat并不能验证embedding可用。
         self._collection = self._client.get_or_create_collection(
-            name=self.COLLECTION_NAME,
+            name=collection_name,
             metadata={"description": "EchoMind RAG 知识库"},
         )
 
         # 如果知识库为空，导入默认文档
-        if self._collection.count() == 0:
+        if seed_default and self._collection.count() == 0:
             self._load_default_docs()
+
+    def cleanup(self):
+        suffix = "_knowledge_base"
+        if not self.collection_name.endswith(suffix):
+            raise ValueError("Cleanup requires an evaluation collection")
+        require_evaluation_namespace(self.collection_name[:-len(suffix)])
+        self._client.delete_collection(self.collection_name)
 
     # ── 文档管理 ──────────────────────────────────────────────────────────────
 
-    def add_documents(self, documents: List[Dict[str, str]]) -> int:
+    def add_documents(self, documents: List[Dict[str, Any]]) -> int:
         """
         批量导入文档到知识库。
 
@@ -83,12 +80,14 @@ class KnowledgeBase:
             title   = doc.get("title", "")
             content = doc.get("content", "")
             chunks  = self._chunk_text(content, chunk_size=500)
+            ref = ContextRef.from_document(doc)
 
             for i, chunk in enumerate(chunks):
-                doc_id = hashlib.md5(f"{title}_{i}_{chunk[:50]}".encode()).hexdigest()
+                doc_id = ref.evidence_id(i)
                 ids.append(doc_id)
                 docs.append(chunk)
-                metas.append({"title": title, "chunk_index": i, "total_chunks": len(chunks)})
+                metas.append({"title": title, "chunk_index": i, "total_chunks": len(chunks),
+                              **ref.to_metadata(), "evidence_id": doc_id})
 
         if ids:
             # ChromaDB 会自动生成 Embedding
@@ -97,40 +96,62 @@ class KnowledgeBase:
 
         return len(ids)
 
-    async def add_documents_async(self, documents: List[Dict[str, str]]) -> int:
+    async def add_documents_async(self, documents: List[Dict[str, Any]]) -> int:
         """异步导入文档；ChromaDB 客户端为同步实现，因此放入线程池执行。"""
         return await asyncio.to_thread(self.add_documents, documents)
 
-    def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def search(self, query: str, top_k: int = 5, *, scope: str = 'public',
+               as_of: Optional[str] = None, versions: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
         """
         语义检索：根据 query 返回最相关的文档片段。
 
         ChromaDB 内部自动将 query 转为向量，与存储的文档向量做余弦相似度匹配。
         """
+        # This is caller-selected applicability, not a production ACL. A trusted
+        # principal must supply permitted scopes before using this for access control.
+        if top_k <= 0 or self._collection.count() == 0:
+            return []
+        cutoff = effective_time(as_of) if as_of else datetime.now(timezone.utc)
         results = self._collection.query(
             query_texts=[query],
-            n_results=top_k,
+            # Filter every stored version before top-k, so an obsolete high-score
+            # chunk cannot hide the active version. Large stores need a manifest.
+            n_results=self._collection.count(),
         )
 
         items = []
+        latest = {}
         if results["documents"] and results["documents"][0]:
             for doc, meta, dist in zip(
                 results["documents"][0],
                 results["metadatas"][0],
                 results["distances"][0],
             ):
+                ref = ContextRef.from_document({**(meta or {}), 'content': doc})
+                if ref.scope not in {'public', scope} or effective_time(ref.effective_at) > cutoff:
+                    continue
+                if versions and ref.id in versions and ref.version != str(versions[ref.id]):
+                    continue
+                identity = (ref.id, ref.scope)
+                rank = (effective_time(ref.effective_at), version_key(ref.version))
+                latest[identity] = max(latest.get(identity, rank), rank)
                 items.append({
                     "title":    meta.get("title", ""),
                     "content":  doc,
                     "score":    round(1.0 - dist, 4),  # ChromaDB 返回距离，转为相似度
                     "chunk":    meta.get("chunk_index", 0),
+                    'context_ref': ref.to_dict(),
+                    'source': ref.source,
+                    'evidence_id': meta.get('evidence_id') or ref.evidence_id(meta.get('chunk_index', 0)),
                 })
 
-        return items
+        return [item for item in items if
+                (effective_time(item['context_ref']['effective_at']), version_key(item['context_ref']['version'])) ==
+                latest[(item['context_ref']['id'], item['context_ref']['scope'])]][:top_k]
 
-    async def search_async(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    async def search_async(self, query: str, top_k: int = 5, **filters) -> List[Dict[str, Any]]:
         """异步检索；ChromaDB 客户端为同步实现，因此放入线程池执行。"""
-        return await asyncio.to_thread(self.search, query, top_k)
+        return await asyncio.to_thread(self.search, query, top_k, **filters)
 
     @property
     def doc_count(self) -> int:
@@ -154,7 +175,8 @@ class KnowledgeBase:
         """
         query = params.get("query", "")
         top_k = params.get("top_k", 5)
-        return await self.search_async(query, top_k=top_k)
+        filters = {key: params[key] for key in ('scope', 'as_of', 'versions') if key in params}
+        return await self.search_async(query, top_k=top_k, **filters)
 
     # ── 内部方法 ──────────────────────────────────────────────────────────────
 

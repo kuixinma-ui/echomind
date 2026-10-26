@@ -18,22 +18,18 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from enum import Enum
 from typing import Any, Dict, List, Optional
 
-import chromadb
 import redis.asyncio as redis
 from anthropic import AsyncAnthropic
 
-from core.llm_utils import extract_text_content
+from core.llm_utils import extract_text_content, parse_structured_response, structured_request_options
+from context import ContextRef, profile_diff
+from memory.roles import MsgRole
+from services.storage import (collection_name, create_chroma_client, memory_key,
+                              require_evaluation_namespace, validate_namespace)
 
 logger = logging.getLogger(__name__)
-
-
-class MsgRole(Enum):
-    USER      = "user"
-    ASSISTANT = "assistant"
-    SYSTEM    = "system"
 
 
 @dataclass
@@ -65,7 +61,7 @@ class MemoryContext:
         if self.relevant_history:
             parts.append("[相关历史]\n" + "\n".join(f"- {self._clean(h)}" for h in self.relevant_history[:3]))
         if self.user_profile:
-            parts.append(f"[用户画像]\n{json.dumps(self.user_profile, ensure_ascii=True)}")
+            parts.append(f"[用户画像]\n以下画像可能包含模型推断，需结合用户更正确认，不代表已核实业务事实。\n{json.dumps(self.user_profile, ensure_ascii=True)}")
         if self.recent_messages:
             parts.append("[最近对话]")
             for m in self.recent_messages[-8:]:
@@ -95,36 +91,51 @@ class MemoryManager:
         api_key:      str = "",
         base_url:     Optional[str] = None,
         model:        str = "claude-3-5-sonnet-20241022",
+        namespace: str = "",
+        chroma_mode: str = 'auto',
+        redis_client=None,
+        chroma_client=None,
+        client=None,
     ):
+        self.namespace = validate_namespace(namespace)
+        # The async runtime can also unwind this instance if __init__ fails.
+        self._runtime_initialized = False
+        self._runtime_collection_names = []
+        self._client = client
+        self._redis = redis_client
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
-        self._client = AsyncAnthropic(**kwargs)
         self._model  = model
 
-        self._redis = redis.from_url(redis_url, decode_responses=True)
-
         # ChromaDB：优先连接独立服务（docker compose 模式），连不上则降级为本地嵌入式
+        chroma = chroma_client if chroma_client is not None else create_chroma_client(chroma_host, chroma_port, chroma_path, mode=chroma_mode)
+        self._chroma = chroma
         try:
-            # HttpClient 默认也会初始化 ChromaDB telemetry；显式关闭避免 posthog 兼容性错误日志。
-            chroma = chromadb.HttpClient(
-                host=chroma_host,
-                port=chroma_port,
-                settings=chromadb.Settings(anonymized_telemetry=False),
-            )
-            chroma.heartbeat()  # 测试连接
-            logger.info(f"ChromaDB 已连接: {chroma_host}:{chroma_port}")
-        except Exception:
-            logger.info(f"ChromaDB 服务不可用，使用本地嵌入式模式: {chroma_path}")
-            chroma = chromadb.PersistentClient(
-                path=chroma_path,
-                settings=chromadb.Settings(anonymized_telemetry=False),
-            )
-
-        # 情景记忆：存储历史对话片段
-        self._episodic = chroma.get_or_create_collection("episodic")
-        # 用户画像：存储提炼出的偏好和实体
-        self._profile  = chroma.get_or_create_collection("user_profile")
+            for base, attribute in (("episodic", "_episodic"), ("user_profile", "_profile")):
+                name = collection_name(namespace, base)
+                setattr(self, attribute, chroma.get_or_create_collection(name))
+                self._runtime_collection_names.append(name)
+            # Allocate async clients only after both synchronous collections exist.
+            self._redis = redis_client if redis_client is not None else redis.from_url(redis_url, decode_responses=True)
+            self._client = client if client is not None else AsyncAnthropic(**kwargs)
+        except BaseException:
+            if namespace:
+                try:
+                    require_evaluation_namespace(namespace)
+                except ValueError:
+                    pass
+                else:
+                    for name in tuple(self._runtime_collection_names):
+                        try:
+                            chroma.delete_collection(name)
+                        except Exception:
+                            # Leave failed deletions owned by the async runtime.
+                            continue
+                        self._runtime_collection_names.remove(name)
+            raise
+        self._profile_locks: Dict[str, asyncio.Lock] = {}
+        self._runtime_initialized = True
 
     # ── 写入 ──────────────────────────────────────────────────────────────────
 
@@ -159,7 +170,36 @@ class MemoryManager:
         if await self._redis.llen(key) >= self.COMPRESS_AT:
             await self._compress(user_id, conv_id)
 
-    async def update_profile(self, user_id: str, conv_id: str) -> None:
+    async def archive_session(self, user_id: str, conv_id: str) -> Dict[str, Any]:
+        """Make a completed session recallable across sessions, without LLM inference.
+
+        Explicit archival must fail on storage errors so an evaluation cannot
+        silently proceed with missing initial facts. Repeating the same archive
+        upserts the same record; the working conversation is left intact.
+        """
+        from context.memory_evidence import memory_evidence_id
+        user_id, conv_id = self._safe_text(user_id), self._safe_text(conv_id)
+        messages = await self._get_working_memory(user_id, conv_id)
+        summary = await self._redis.get(self._summary_key(user_id, conv_id)) or ''
+        text = '\n'.join(([f'[earlier summary] {summary}'] if summary else []) +
+                         [f'{message.role.value}: {message.content}' for message in messages]).strip()
+        if not text:
+            raise ValueError('Cannot archive an empty session')
+        evidence_id = memory_evidence_id(text)
+        document_id = hashlib.sha256(json.dumps([user_id, conv_id, evidence_id]).encode()).hexdigest()
+        await asyncio.to_thread(self._episodic.upsert, ids=[document_id], documents=[text], metadatas=[{
+            'user_id': user_id, 'conv_id': conv_id, 'source': 'session_archive',
+            'evidence_id': evidence_id, 'ts': datetime.now().isoformat(), 'summary_inferred': bool(summary),
+        }])
+        return {'evidence_id': evidence_id, 'source_conv': conv_id, 'message_count': len(messages)}
+
+    async def update_profile(self, user_id: str, conv_id: str) -> bool:
+        """Return False on extraction/storage failure; an empty conversation is a no-op success."""
+        user_id = self._safe_text(user_id)
+        async with self._profile_locks.setdefault(user_id, asyncio.Lock()):
+            return await self._update_profile(user_id, conv_id)
+
+    async def _update_profile(self, user_id: str, conv_id: str) -> bool:
         """
         从当前工作记忆中提炼用户偏好，更新用户画像。
         用 LLM 提炼偏好，然后存入 ChromaDB（ChromaDB 内置 embedding，不依赖外部 API）。
@@ -168,7 +208,7 @@ class MemoryManager:
         conv_id = self._safe_text(conv_id)
         messages = await self._get_working_memory(user_id, conv_id)
         if not messages:
-            return
+            return True
 
         current_profile = await self._get_profile(user_id)
 
@@ -181,6 +221,7 @@ class MemoryManager:
 已有画像:
 {profile_ctx}
 
+明确更正应替换旧值；明确要求忘记的信息应删除对应字段。以下结果只是模型推断，不能视为已核实业务事实。
 返回格式: {{"preferences": ["..."], "entities": {{"产品": [], "问题类型": []}}}}"""
         prompt = self._safe_text(prompt)
 
@@ -188,33 +229,58 @@ class MemoryManager:
             resp = await self._client.messages.create(
                 model=self._model, max_tokens=512, temperature=0.0,
                 messages=[{"role": "user", "content": prompt}],
+                **structured_request_options(),
             )
-            raw = extract_text_content(resp.content)
-            s, e = raw.find("{"), raw.rfind("}") + 1
-            profile_data = json.loads(raw[s:e])
-
-            doc_id = self._profile_doc_id(user_id)
-            doc_text = self._safe_text(json.dumps(profile_data, ensure_ascii=False))
-
-            try:
-                await asyncio.to_thread(self._profile.delete, ids=[doc_id])
-            except Exception:
-                pass
-
-            # 直接传 documents，让 ChromaDB 内置模型生成 embedding（不依赖 Voyage API）
-            await asyncio.to_thread(
-                self._profile.add,
-                ids=[doc_id],
-                documents=[doc_text],
-                metadatas=[{
-                    "user_id": user_id,
-                    "conv_id": conv_id,
-                    "updated_at": datetime.now().isoformat(),
-                }],
-            )
+            profile_data = parse_structured_response(resp, dict)
+            if not isinstance(profile_data, dict):
+                raise ValueError('Profile extraction must return an object')
+            await self._write_profile(user_id, conv_id, profile_data, current_profile, inferred=True)
             logger.info(f"用户画像已更新: {user_id}")
+            return True
         except Exception as ex:
             logger.warning(f"更新用户画像失败: {ex}")
+            return False
+
+    async def seed_profile(self, user_id: str, profile: Dict[str, Any], *,
+                           source_conv: str = 'scenario_initial_state') -> Dict[str, Any]:
+        """Experiment-only fixture seeding, never available for production namespaces."""
+        require_evaluation_namespace(self.namespace)
+        if not isinstance(profile, dict):
+            raise ValueError('Profile seed must be an object')
+        user_id = self._safe_text(user_id)
+        async with self._profile_locks.setdefault(user_id, asyncio.Lock()):
+            before = await self._get_profile(user_id)
+            return await self._write_profile(user_id, self._safe_text(source_conv), profile,
+                                             before, inferred=False, experiment_seed=True)
+
+    async def _write_profile(self, user_id, conv_id, profile, before, *, inferred, experiment_seed=False):
+        doc_id = self._profile_doc_id(user_id)
+        stored = await asyncio.to_thread(self._profile.get, ids=[doc_id])
+        metadata = (stored.get('metadatas') or [{}])[0] or {}
+        version = str(int(metadata.get('version', '0')) + 1)
+        updated_at = datetime.now().isoformat()
+        ref = ContextRef(id=doc_id, type='user_profile', version=version,
+                         source=conv_id, scope='user:' + user_id, effective_at=updated_at)
+        audit = {**profile_diff(before, profile), 'source_conv': conv_id,
+                 'version': version, 'inferred': inferred, 'experiment_seed': experiment_seed,
+                 'context_ref': ref.to_dict(), 'updated_at': updated_at}
+        # One upsert keeps the old profile readable until the new document replaces it.
+        await asyncio.to_thread(self._profile.upsert, ids=[doc_id],
+                                documents=[self._safe_text(json.dumps(profile, ensure_ascii=False))],
+                                metadatas=[{'user_id': user_id, 'conv_id': conv_id,
+                                            'source_conv': conv_id, 'updated_at': updated_at,
+                                            'inferred': inferred, 'experiment_seed': experiment_seed,
+                                            **ref.to_metadata()}])
+        await self._redis.lpush(self._profile_audit_key(user_id), json.dumps(audit, ensure_ascii=True))
+        return audit
+
+    async def get_profile_audit(self, user_id: str) -> List[Dict[str, Any]]:
+        """Read this user's last 10,000 profile changes in chronological order."""
+        rows = await self._redis.lrange(self._profile_audit_key(self._safe_text(user_id)), 0, 9999)
+        return [json.loads(row) for row in reversed(rows)]
+
+    def _profile_audit_key(self, user_id: str) -> str:
+        return memory_key(self.namespace, 'profile_audit', user_id, '')
 
     # ── 读取 ──────────────────────────────────────────────────────────────────
 
@@ -292,7 +358,7 @@ class MemoryManager:
         # 重置工作记忆为最近 5 条
         key = self._wm_key(user_id, conv_id)
         await self._redis.delete(key)
-        for m in reversed(keep):
+        for m in keep:
             await self._redis.lpush(key, json.dumps({
                 "role": m.role.value, "content": m.content,
                 "ts": m.timestamp.isoformat(), "metadata": m.metadata,
@@ -325,7 +391,7 @@ class MemoryManager:
             results = await self._query_episodic(
                 query_text,
                 n_results=self.HISTORY_TOP_K,
-                where={"user_id": self._safe_text(user_id), "conv_id": self._safe_text(conv_id)},
+                where={"$and": [{"user_id": self._safe_text(user_id)}, {"conv_id": self._safe_text(conv_id)}]},
             )
             docs = self._extract_docs(results)
             if len(docs) < self.HISTORY_TOP_K:
@@ -376,14 +442,20 @@ class MemoryManager:
     async def close(self) -> None:
         """关闭异步 Redis 连接。"""
         await self._redis.aclose()
+        await self._client.close()
 
-    @staticmethod
-    def _wm_key(user_id: str, conv_id: str) -> str:
-        return f"wm:{user_id}:{conv_id}"
+    async def cleanup(self) -> None:
+        require_evaluation_namespace(self.namespace)
+        async for key in self._redis.scan_iter(match=f"{self.namespace}:*"):
+            await self._redis.delete(key)
+        for base in ("episodic", "user_profile"):
+            await asyncio.to_thread(self._chroma.delete_collection, collection_name(self.namespace, base))
 
-    @staticmethod
-    def _summary_key(user_id: str, conv_id: str) -> str:
-        return f"summary:{user_id}:{conv_id}"
+    def _wm_key(self, user_id: str, conv_id: str) -> str:
+        return memory_key(self.namespace, "wm", user_id, conv_id)
+
+    def _summary_key(self, user_id: str, conv_id: str) -> str:
+        return memory_key(self.namespace, "summary", user_id, conv_id)
 
     @classmethod
     def _profile_doc_id(cls, user_id: str) -> str:

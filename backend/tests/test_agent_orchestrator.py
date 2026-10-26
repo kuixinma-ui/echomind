@@ -84,6 +84,97 @@ def test_escalation_agent_is_a_real_non_llm_handoff_node():
     assert client.calls == []
 
 
+def test_escalation_response_discloses_demo_boundary_without_promising_followup():
+    result = asyncio.run(EscalationAgent(FakeClient(), "test-model").handle(make_request(
+        message="请转人工客服。",
+        intent=IntentCategory.HUMAN_HANDOFF,
+    )))
+
+    assert "演示" in result.content
+    assert "未接入真实人工队列" in result.content
+    assert "不能保证有人跟进" in result.content
+    assert "人工客服会根据会话记录继续核验" not in result.content
+
+
+def test_escalation_preserves_current_communication_request_without_inventing_channel():
+    agent = EscalationAgent(FakeClient(), "test-model")
+    known = asyncio.run(agent.handle(make_request(
+        message="请转人工，我不方便接电话，希望文字沟通。",
+        intent=IntentCategory.HUMAN_HANDOFF,
+    )))
+    unknown = asyncio.run(agent.handle(make_request(
+        message="请转人工。",
+        intent=IntentCategory.HUMAN_HANDOFF,
+    )))
+
+    assert "希望文字沟通" in known.content
+    assert "不方便接电话" in known.content
+    assert "文字沟通" not in unknown.content
+
+
+def test_escalation_current_communication_correction_precedes_archived_preference():
+    result = asyncio.run(EscalationAgent(FakeClient(), "test-model").handle(make_request(
+        message="现在改为电话沟通，请转人工。",
+        context="[相关历史]\n- user: 我偏好文字沟通，不方便接电话。",
+        intent=IntentCategory.HUMAN_HANDOFF,
+    )))
+
+    assert "现在改为电话沟通" in result.content
+    assert "偏好文字沟通" not in result.content
+
+
+def test_chat_service_delivers_archived_communication_preference_to_handoff():
+    from collections import deque
+    from types import SimpleNamespace
+
+    from agents.agent_orchestrator import AgentOrchestrator
+    from core.intent_recognizer import IntentResult
+    from services.chat_service import ChatService
+
+    prior = "user: 我有听力障碍，偏好文字沟通，不方便接电话。"
+
+    class OfflineMemory:
+        async def get_context(self, user_id, conv_id, query):
+            return SimpleNamespace(
+                recent_messages=[], relevant_history=[prior],
+                to_prompt_text=lambda: f"[相关历史]\n- {prior}",
+            )
+
+        async def add_message(self, user_id, conv_id, role, content):
+            pass
+
+        async def update_profile(self, user_id, conv_id):
+            return True
+
+    class OfflineRecognizer:
+        async def recognize(self, message, history=None):
+            return IntentResult(
+                intent=IntentCategory.HUMAN_HANDOFF, intent_group="escalation",
+                confidence=1.0, urgency=UrgencyLevel.HIGH,
+                entities={}, reasoning="offline fixture", latency_ms=0,
+            )
+
+    orchestrator = AgentOrchestrator.__new__(AgentOrchestrator)
+    orchestrator._intent_recognizer = OfflineRecognizer()
+    orchestrator._pool = {AgentType.ESCALATION: [EscalationAgent(FakeClient(), "test-model")]}
+    orchestrator._recent_tool_traces = deque(maxlen=10)
+
+    async def exercise():
+        service = ChatService(orchestrator, OfflineMemory())
+        try:
+            return await service.chat("请按上次的沟通偏好转人工。", "u1", "new-session",
+                                      wait_for_profile=True)
+        finally:
+            await service.close()
+
+    result = asyncio.run(exercise())
+
+    assert result["primary_agent"] == "escalation"
+    assert "偏好文字沟通" in result["response"]
+    assert "不方便接电话" in result["response"]
+    assert "不能保证有人跟进" in result["response"]
+
+
 def test_composer_fallback_preserves_primary_and_supporting_results():
     composer = ResponseComposer(FakeClient(error=RuntimeError("provider down")), "test-model")
     req = make_request()
@@ -195,6 +286,13 @@ def test_tool_use_round_trip_executes_only_whitelisted_tool():
 
     assert response.success is True
     assert response.tools_used == ["lookup_error_code"]
+    assert len(response.tool_traces) == 1
+    trace = response.tool_traces[0]
+    assert trace["tool_name"] == "lookup_error_code"
+    assert trace["tool_use_id"] == "toolu_1"
+    assert trace["input"] == {"error_code": "401"}
+    assert trace["success"] is True
+    assert trace["latency_ms"] >= 0
     assert len(client.calls) == 2
     assert {tool["name"] for tool in client.calls[0]["tools"]} == {
         "lookup_error_code",

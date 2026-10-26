@@ -13,23 +13,39 @@
 LLM-as-Judge 是评测 Agent 质量的关键技术：
   人工标注成本高、主观性强；用 LLM 评判可以规模化、可重复。
 """
-import asyncio
+import copy
 import json
 import logging
+import math
 import pathlib
+import re
 import statistics
-import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
 
-from core.llm_utils import extract_text_content
+from core.llm_utils import parse_structured_response, structured_request_options
 
 from core.intent_recognizer import IntentCategory, IntentRecognizer
 
 logger = logging.getLogger(__name__)
+SCORE_FIELDS = ("relevance", "accuracy", "completeness", "helpfulness")
+
+
+def _validated_scores(data: Dict[str, Any]) -> Dict[str, float]:
+    """Reject incomplete or fabricated scores rather than filling defaults."""
+    validated = {}
+    for name in SCORE_FIELDS:
+        value = data[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{name} must be a number")
+        if not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError(f"{name} must be finite and within [0, 1]")
+        validated[name] = float(value)
+    return validated
 
 
 # ── 数据结构 ──────────────────────────────────────────────────────────────────
@@ -44,16 +60,22 @@ class IntentTestCase:
 @dataclass
 class QualityScores:
     """LLM-as-Judge 评分结果。"""
-    relevance:    float   # 相关性：回答是否针对问题
-    accuracy:     float   # 准确性：信息是否正确
-    completeness: float   # 完整性：是否完整解决问题
-    helpfulness:  float   # 有用性：用户是否能据此行动
+    relevance:    Optional[float]   # 相关性：回答是否针对问题
+    accuracy:     Optional[float]   # 准确性：信息是否正确
+    completeness: Optional[float]   # 完整性：是否完整解决问题
+    helpfulness:  Optional[float]   # 有用性：用户是否能据此行动
     judge_failed: bool = False
     error: Optional[str] = None
 
     @property
-    def overall(self) -> float:
-        return statistics.mean([self.relevance, self.accuracy, self.completeness, self.helpfulness])
+    def overall(self) -> Optional[float]:
+        if self.judge_failed:
+            return None
+        try:
+            values = _validated_scores({name: getattr(self, name) for name in SCORE_FIELDS})
+        except (KeyError, ValueError, TypeError):
+            return None
+        return statistics.mean(values.values())
 
 
 @dataclass
@@ -76,6 +98,10 @@ class EvalReport:
     regressions:      List[str]          # 相比基线退化的指标
     recommendations:  List[str]
     results:          List[EvalResult]
+    run_id:           str = ""
+    metadata:         Dict[str, Any] = field(default_factory=dict)
+    invalid:          int = 0
+    valid_count:      int = 0
 
 
 # ── LLM-as-Judge ─────────────────────────────────────────────────────────────
@@ -115,8 +141,15 @@ Agent 响应: {response}
         question: str,
         response: str,
         context: Optional[str] = None,
+        *,
+        expected: Any = None,
+        evidence: Any = None,
     ) -> QualityScores:
         ctx_section = f"背景信息: {context}" if context else ""
+        if expected is not None:
+            ctx_section += "\n预期结果: " + json.dumps(expected, ensure_ascii=False)
+        if evidence is not None:
+            ctx_section += "\n可核查证据: " + json.dumps(evidence, ensure_ascii=False)
         prompt = self.JUDGE_PROMPT.format(
             question=question,
             response=response,
@@ -127,20 +160,14 @@ Agent 响应: {response}
             resp = await self._client.messages.create(
                 model=self._model, max_tokens=256, temperature=0.0,
                 messages=[{"role": "user", "content": prompt}],
+                **structured_request_options(),
             )
-            raw = extract_text_content(resp.content)
-            s, e = raw.find("{"), raw.rfind("}") + 1
-            data = json.loads(raw[s:e])
-            return QualityScores(
-                relevance=float(data.get("relevance", 0.5)),
-                accuracy=float(data.get("accuracy", 0.5)),
-                completeness=float(data.get("completeness", 0.5)),
-                helpfulness=float(data.get("helpfulness", 0.5)),
-            )
+            data = parse_structured_response(resp, dict)
+            return QualityScores(**_validated_scores(data))
         except Exception as ex:
             logger.warning(f"LLM Judge 失败: {ex}")
             return QualityScores(
-                0.5, 0.5, 0.5, 0.5,
+                None, None, None, None,
                 judge_failed=True,
                 error=str(ex),
             )
@@ -223,6 +250,7 @@ class EndToEndEvaluator:
 
     # 质量及格线
     PASS_THRESHOLD = 0.75
+    FINGERPRINT_FIELDS = ("dataset", "model", "prompt", "skills", "knowledge", "code", "judge", "retrieval")
 
     def __init__(
         self,
@@ -232,6 +260,8 @@ class EndToEndEvaluator:
         base_url: Optional[str] = None,
         model:    str = "claude-3-5-sonnet-20241022",
         baseline_path: Optional[str] = None,
+        chat_service=None,
+        report_dir: Optional[str] = None,
     ):
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
@@ -239,16 +269,21 @@ class EndToEndEvaluator:
         client = AsyncAnthropic(**kwargs)
 
         self._orchestrator     = orchestrator
+        self._chat_service     = chat_service
         self._judge            = LLMJudge(client, model)
         self._intent_evaluator = IntentEvaluator(recognizer)
         self._history:         List[EvalReport] = []
         self._baseline_path = pathlib.Path(baseline_path) if baseline_path else None
+        self._report_dir = pathlib.Path(report_dir) if report_dir else (
+            self._baseline_path.parent / "runs" if self._baseline_path else pathlib.Path(__file__).parent / "reports"
+        )
         self._baseline: Optional[EvalReport] = self._load_baseline()
 
     async def run(
         self,
         intent_cases:    Optional[List[IntentTestCase]] = None,
         dialog_cases:    Optional[List[Dict[str, Any]]] = None,
+        metadata:       Optional[Dict[str, Any]] = None,
     ) -> EvalReport:
         """
         运行完整评测。
@@ -258,6 +293,13 @@ class EndToEndEvaluator:
           - 单轮: [{"question": "..."}]
           - 多轮: [{"turns": ["第一轮", "第二轮", ...]}]
         """
+        run_metadata = copy.deepcopy(metadata or {})
+        run_id = run_metadata.get("run_id", uuid.uuid4().hex)
+        self._validate_run_id(run_id)
+        if (self._report_dir / f"{run_id}.json").exists():
+            raise ValueError(f"Run already archived: {run_id}")
+        coverage = "chat_service" if self._chat_service is not None else "legacy_orchestrator"
+        run_metadata["coverage"] = coverage
         results: List[EvalResult] = []
         all_scores: Dict[str, List[float]] = {
             "relevance": [], "accuracy": [], "completeness": [], "helpfulness": []
@@ -266,24 +308,31 @@ class EndToEndEvaluator:
         # 1. 意图识别评测
         intent_metrics: Dict[str, Any] = {}
         if intent_cases:
-            intent_metrics = await self._intent_evaluator.evaluate(intent_cases)
-            passed = intent_metrics["accuracy"] >= self.PASS_THRESHOLD
-            results.append(EvalResult(
-                test_id="intent_recognition",
-                passed=passed,
-                scores={"accuracy": intent_metrics["accuracy"], "macro_f1": intent_metrics["macro_f1"]},
-                detail=f"准确率 {intent_metrics['accuracy']:.1%}，Macro-F1 {intent_metrics['macro_f1']:.3f}",
-                metadata={
-                    "total": intent_metrics.get("total", 0),
-                    "correct": intent_metrics.get("correct", 0),
-                    "cases": intent_metrics.get("cases", []),
-                },
-            ))
+            try:
+                intent_metrics = await self._intent_evaluator.evaluate(intent_cases)
+                passed = intent_metrics["accuracy"] >= self.PASS_THRESHOLD
+                results.append(EvalResult(
+                    test_id="intent_recognition",
+                    passed=passed,
+                    scores={"accuracy": intent_metrics["accuracy"], "macro_f1": intent_metrics["macro_f1"]},
+                    detail=f"准确率 {intent_metrics['accuracy']:.1%}，Macro-F1 {intent_metrics['macro_f1']:.3f}",
+                    metadata={
+                        "total": intent_metrics.get("total", 0),
+                        "correct": intent_metrics.get("correct", 0),
+                        "cases": intent_metrics.get("cases", []),
+                        "status": "passed" if passed else "failed",
+                    },
+                ))
+            except Exception as ex:
+                intent_metrics = {}
+                results.append(EvalResult("intent_recognition", False, {}, str(ex), {
+                    "status": "error", "error": str(ex), "total": len(intent_cases),
+                }))
 
         # 2. 对话质量评测（调用 orchestrator 产出回复，再用 LLM Judge 评分）
         if dialog_cases:
             for i, case in enumerate(dialog_cases):
-                case_results = await self._evaluate_dialog_case(case, i)
+                case_results = await self._evaluate_dialog_case(case, i, run_id=run_id)
                 results.extend(case_results)
                 for r in case_results:
                     for k in all_scores:
@@ -301,10 +350,18 @@ class EndToEndEvaluator:
         pass_rate    = passed_count / len(results) if results else 0.0
 
         # 4. 回归检测
-        regressions = self._detect_regressions(avg_scores)
+        comparison = self._comparison(run_metadata, avg_scores)
+        run_metadata["comparison"] = comparison
+        regressions = self._detect_regressions(avg_scores) if comparison["comparable"] else []
 
         # 5. 优化建议
         recommendations = self._recommendations(avg_scores, intent_metrics)
+        invalid_count = sum(r.metadata.get("status") in {"invalid", "error"} for r in results)
+        if not results or invalid_count == len(results):
+            recommendations = ["无有效评测结果；检查测试集、服务与 Judge 错误后重试"]
+        elif invalid_count:
+            recommendations = [r for r in recommendations if r != "所有指标均达标，继续保持"]
+            recommendations.append(f"{invalid_count} 项无法评估；修复后重跑，未计入质量均分")
 
         report = EvalReport(
             timestamp=datetime.now().isoformat(),
@@ -315,64 +372,76 @@ class EndToEndEvaluator:
             regressions=regressions,
             recommendations=recommendations,
             results=results,
+            run_id=run_id,
+            metadata=run_metadata,
+            invalid=invalid_count,
+            valid_count=len(results) - invalid_count,
         )
+        self._save_report(report)
         self._history.append(report)
-        self._save_baseline(report)
         return report
 
-    async def _evaluate_dialog_case(self, case: Dict[str, Any], case_idx: int) -> List[EvalResult]:
+    async def _evaluate_dialog_case(self, case: Dict[str, Any], case_idx: int, *, run_id: str = "") -> List[EvalResult]:
         """评测单轮或多轮对话用例。"""
         from agents.agent_orchestrator import Request as OrcReq
 
         questions = self._dialog_turns(case)
         if not questions:
-            return []
+            return [EvalResult(f"dialog_{case_idx}", False, {}, "Empty dialog case", {
+                "status": "invalid", "error": "Empty dialog case",
+            })]
 
-        conv_id = str(case.get("conv_id") or f"eval_{case_idx}")
-        user_id = str(case.get("user_id") or "eval_user")
+        conv_id = str(case.get("conv_id") or f"eval_{run_id}_{case_idx}")
+        user_id = str(case.get("user_id") or f"eval_user_{run_id}")
         history: List[Dict[str, str]] = []
         results: List[EvalResult] = []
 
         for turn_idx, question in enumerate(questions):
             context = self._history_context(history)
-            orch_req = OrcReq(
-                message=question,
-                user_id=user_id,
-                conv_id=conv_id,
-                context=context,
-                history=history[-6:] if history else None,
-            )
-            orch_result = await self._orchestrator.run(orch_req)
-            actual_answer = orch_result.response
-
-            scores = await self._judge.judge(question, actual_answer, context=context or None)
-            passed = scores.overall >= self.PASS_THRESHOLD
-
-            history.append({"role": "user", "content": question})
-            history.append({"role": "assistant", "content": actual_answer})
-
             test_id = f"dialog_{case_idx}" if len(questions) == 1 else f"dialog_{case_idx}_turn_{turn_idx}"
+            result_metadata = {
+                "question": question, "turn": turn_idx, "conv_id": conv_id,
+                "coverage": "chat_service" if self._chat_service is not None else "legacy_orchestrator",
+            }
+            try:
+                if self._chat_service is not None:
+                    reply = await self._chat_service.chat(question, user_id, conv_id, wait_for_profile=True)
+                    conv_id = str(reply.get("conv_id") or conv_id)
+                else:
+                    orch_result = await self._orchestrator.run(OrcReq(
+                        message=question, user_id=user_id, conv_id=conv_id,
+                        context=context, history=history[-6:] if history else None,
+                    ))
+                    reply = {
+                        "response": orch_result.response,
+                        "agent_type": orch_result.agent_type.value,
+                        "intent": orch_result.intent.value if orch_result.intent else None,
+                    }
+                actual_answer = reply["response"]
+                result_metadata.update(reply)
+                result_metadata["conv_id"] = conv_id
+            except Exception as ex:
+                result_metadata.update(status="error", error=str(ex), error_type=type(ex).__name__)
+                results.append(EvalResult(test_id, False, {}, str(ex), result_metadata))
+                continue
+
+            history.extend([{"role": "user", "content": question}, {"role": "assistant", "content": actual_answer}])
+            judge_kwargs = {k: case[k] for k in ("expected", "evidence") if k in case}
+            try:
+                scores = await self._judge.judge(question, actual_answer, context=context or None, **judge_kwargs)
+                overall = scores.overall
+                if scores.judge_failed or overall is None:
+                    raise ValueError(scores.error or "Invalid Judge scores")
+                values = _validated_scores({name: getattr(scores, name) for name in SCORE_FIELDS})
+            except Exception as ex:
+                result_metadata.update(status="invalid", judge_failed=True, judge_error=str(ex))
+                results.append(EvalResult(test_id, False, {}, str(ex), result_metadata))
+                continue
+            passed = overall >= self.PASS_THRESHOLD
+            result_metadata.update(status="passed" if passed else "failed", judge_failed=False, judge_error=None)
             results.append(EvalResult(
-                test_id=test_id,
-                passed=passed,
-                scores={
-                    "relevance": scores.relevance,
-                    "accuracy": scores.accuracy,
-                    "completeness": scores.completeness,
-                    "helpfulness": scores.helpfulness,
-                    "overall": scores.overall,
-                },
-                detail=f"Q: {question[:30]}... → 综合评分 {scores.overall:.3f}",
-                metadata={
-                    "question": question,
-                    "response": actual_answer,
-                    "agent_type": orch_result.agent_type.value,
-                    "intent": orch_result.intent.value if orch_result.intent else None,
-                    "turn": turn_idx,
-                    "conv_id": conv_id,
-                    "judge_failed": scores.judge_failed,
-                    "judge_error": scores.error,
-                },
+                test_id, passed, {**values, "overall": overall},
+                f"Q: {question[:30]}... → 综合评分 {overall:.3f}", result_metadata,
             ))
 
         return results
@@ -393,8 +462,8 @@ class EndToEndEvaluator:
         return "[评测多轮历史]\n" + "\n".join(lines)
 
     def _detect_regressions(self, current: Dict[str, float]) -> List[str]:
-        """与上一次评测对比，找出退化超过 5% 的指标。"""
-        prev_report = self._history[-1] if self._history else self._baseline
+        """Only an explicitly promoted, comparable baseline is consulted."""
+        prev_report = self._baseline
         if prev_report is None:
             return []
         prev = prev_report.avg_scores
@@ -407,6 +476,33 @@ class EndToEndEvaluator:
                         f"{metric}: {prev[metric]:.3f} → {value:.3f} (退化 {abs(delta):.1%})"
                     )
         return regressions
+
+    def _comparison(self, metadata: Dict[str, Any], scores: Dict[str, float]) -> Dict[str, Any]:
+        result = {"comparable": False, "reason": "No promoted baseline", "baseline_run_id": None}
+        if self._baseline is None:
+            return result
+        result["baseline_run_id"] = self._baseline.run_id
+        current = metadata.get("fingerprints", metadata)
+        previous = self._baseline.metadata.get("fingerprints", self._baseline.metadata)
+        missing = [name for name in self.FINGERPRINT_FIELDS if (
+            not isinstance(current, dict) or not isinstance(previous, dict)
+            or current.get(name) in (None, "", {}) or previous.get(name) in (None, "", {})
+        )]
+        if missing:
+            result["reason"] = "Missing snapshot fingerprints: " + ", ".join(missing)
+            return result
+        changed = [name for name in self.FINGERPRINT_FIELDS if current[name] != previous[name]]
+        if changed:
+            result["reason"] = "Different snapshot fingerprints: " + ", ".join(changed)
+            return result
+        if metadata.get("coverage") != self._baseline.metadata.get("coverage"):
+            result["reason"] = "Different evaluation coverage"
+            return result
+        if not scores or not self._baseline.avg_scores:
+            result["reason"] = "No valid metrics to compare"
+            return result
+        result.update(comparable=True, reason="Same dataset and configuration snapshot")
+        return result
 
     def _recommendations(
         self,
@@ -441,17 +537,31 @@ class EndToEndEvaluator:
             return None
 
     def _save_baseline(self, report: EvalReport) -> None:
+        """Private compatibility alias; ordinary runs never call this."""
+        self.promote_baseline(report)
+
+    def promote_baseline(self, report: EvalReport) -> None:
+        """Explicitly freeze a report; subsequent runs cannot replace it."""
         if not self._baseline_path:
-            return
-        try:
-            self._baseline_path.parent.mkdir(parents=True, exist_ok=True)
-            self._baseline_path.write_text(
-                json.dumps(asdict(report), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            self._baseline = report
-        except Exception as ex:
-            logger.warning(f"保存评测基线失败: {ex}")
+            raise ValueError("baseline_path is required to promote a baseline")
+        payload = json.dumps(asdict(report), ensure_ascii=False, indent=2, allow_nan=False)
+        self._baseline_path.parent.mkdir(parents=True, exist_ok=True)
+        self._baseline_path.write_text(payload, encoding="utf-8")
+        self._baseline = self._report_from_dict(json.loads(payload))
+
+    @staticmethod
+    def _validate_run_id(run_id: str) -> None:
+        if not isinstance(run_id, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", run_id) is None:
+            raise ValueError("run_id must contain only letters, digits, hyphens or underscores")
+        if run_id.split("_")[0].upper() in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}:
+            raise ValueError("run_id cannot be a reserved Windows filename")
+
+    def _save_report(self, report: EvalReport) -> None:
+        self._validate_run_id(report.run_id)
+        payload = json.dumps(asdict(report), ensure_ascii=False, indent=2, allow_nan=False)
+        self._report_dir.mkdir(parents=True, exist_ok=True)
+        with (self._report_dir / f"{report.run_id}.json").open("x", encoding="utf-8") as output:
+            output.write(payload)
 
     @staticmethod
     def _report_from_dict(data: Dict[str, Any]) -> EvalReport:
@@ -473,6 +583,10 @@ class EndToEndEvaluator:
                 )
                 for r in data.get("results", [])
             ],
+            run_id=str(data.get("run_id", "")),
+            metadata=dict(data.get("metadata", {})),
+            invalid=int(data.get("invalid", 0)),
+            valid_count=int(data.get("valid_count", data.get("total", 0) - data.get("invalid", 0))),
         )
 
 

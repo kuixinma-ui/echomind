@@ -1,0 +1,17 @@
+{
+  "stage": "chroma_default_embedding_http",
+  "embedding": "all-MiniLM-L6-v2",
+  "default_embedding_verified": true,
+  "model_requests": 0,
+  "status": "passed",
+  "collections": [
+    "eval_33b47a9e63d4437f98d8acb499751eac_default_ef",
+    "eval_5810036cdb184d049dec365436be0f4d_sentinel"
+  ],
+  "filtered_query": true,
+  "user_isolation": true,
+  "sentinel_preserved": true,
+  "python_connections_local_only": true,
+  "cleanup": "passed",
+  "local_connections": 2
+}

@@ -17,6 +17,7 @@ import hashlib
 import inspect
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -24,7 +25,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from anthropic import AsyncAnthropic
 
-from core.llm_utils import extract_text_content
+from core.llm_utils import parse_structured_response, structured_request_options
 
 logger = logging.getLogger(__name__)
 
@@ -134,14 +135,49 @@ class MCPToolManager:
       用户查询 → 查询改写（多角度子查询）→ 并行召回 → 结果重排 → 返回 Top-K
     """
 
-    def __init__(self, api_key: str, base_url: Optional[str] = None, model: str = "claude-3-5-sonnet-20241022"):
+    def __init__(self, api_key: str, base_url: Optional[str] = None, model: str = "claude-3-5-sonnet-20241022",
+                 *, rewrite_policy: str = 'always', rerank_policy: str = 'always',
+                 client=None, retrieval_timeout_s: float = 30.0):
+        for policy in (rewrite_policy, rerank_policy):
+            if policy not in {'always', 'never', 'adaptive'}:
+                raise ValueError('Retrieval policy must be always, never, or adaptive')
+        if retrieval_timeout_s <= 0:
+            raise ValueError('retrieval_timeout_s must be positive')
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
-        self._client = AsyncAnthropic(**kwargs)
+        self._client = client if client is not None else AsyncAnthropic(**kwargs)
         self._model  = model
         self._tools: Dict[str, Tool] = {}
         self._cache: Dict[str, tuple] = {}   # key → (result, expire_at, reranked)
+        self._rewrite_policy = rewrite_policy
+        self._rerank_policy = rerank_policy
+        self._retrieval_timeout_s = retrieval_timeout_s
+        self._retrieval_counts = dict(searches=0, rewrite_calls=0, rewrite_fallbacks=0,
+                                      rerank_calls=0, rerank_fallbacks=0, candidate_count=0)
+
+    def retrieval_snapshot(self) -> Dict[str, Any]:
+        """Immutable configuration values suitable for experiment comparison."""
+        return {'rewrite_policy': self._rewrite_policy, 'rerank_policy': self._rerank_policy,
+                'adaptive_rules_version': '1', 'retrieval_timeout_s': self._retrieval_timeout_s}
+
+    def retrieval_stats(self) -> Dict[str, int]:
+        return dict(self._retrieval_counts)
+
+    def _should_rewrite(self, query: str) -> bool:
+        if self._rewrite_policy == 'never' or not query.strip():
+            return False
+        if self._rewrite_policy == 'always':
+            return True
+        normalized = query.strip().lower().rstrip('!?！。？ ')
+        greeting = normalized in {'你好', '您好', '嗨', '谢谢', '再见', 'hello', 'hi', 'thanks'}
+        structured = bool(re.search(r'(?:订单号|order[_ ]?id|单号)\s*[:：=]?\s*[A-Za-z0-9_-]+', query, re.I))
+        return not greeting and not structured
+
+    def _should_rerank(self, count: int, top_k: int) -> bool:
+        if self._rerank_policy == 'never' or count <= top_k:
+            return False
+        return self._rerank_policy == 'always' or count > max(5, top_k * 2)
 
     # ── 注册 / 注销 ───────────────────────────────────────────────────────────
 
@@ -211,7 +247,7 @@ class MCPToolManager:
             reranked = False
             if rerank_top_k > 0 and tool.supports_rerank and isinstance(data, list):
                 query = params.get("query", "")
-                data, reranked = await self._rerank(query, data, rerank_top_k), True
+                data, reranked = await self._rerank_with_status(query, data, rerank_top_k)
 
             # 写缓存：缓存最终返回结果，避免下次命中未重排的原始结果。
             if tool.cache_ttl > 0:
@@ -290,22 +326,30 @@ class MCPToolManager:
           原始: "退款流程"
           改写: ["如何申请退款", "退款需要多少天", "退款政策是什么"]
         """
+        if not self._should_rewrite(query):
+            return [query]
         prompt = f"""将以下用户查询改写为 {n} 个不同角度的搜索子查询，用于检索知识库。
 要求：每个子查询角度不同，覆盖原始问题的不同方面。
 原始查询: "{query}"
 返回 JSON 数组，例如: ["子查询1", "子查询2", "子查询3"]"""
         prompt = self._clean_text(prompt)
         try:
-            resp = await self._client.messages.create(
-                model=self._model, max_tokens=256, temperature=0.3,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = extract_text_content(resp.content)
-            s, e = raw.find("["), raw.rfind("]") + 1
-            queries = json.loads(raw[s:e])
+            from observability.telemetry import get_telemetry
+            self._retrieval_counts['rewrite_calls'] += 1
+            with get_telemetry().span('retrieval.rewrite', kind='generation',
+                                      metadata={'policy': self._rewrite_policy}) as observation:
+                resp = await asyncio.wait_for(self._client.messages.create(
+                    model=self._model, max_tokens=256, temperature=0.3,
+                    messages=[{"role": "user", "content": prompt}],
+                    **structured_request_options(),
+                ), timeout=self._retrieval_timeout_s)
+            queries = parse_structured_response(resp, list)
+            if not isinstance(queries, list) or not all(isinstance(q, str) and q.strip() for q in queries):
+                raise ValueError('Rewrite must return nonempty strings')
             # 原始查询也保留，去重
             return list(dict.fromkeys([query] + queries))
         except Exception as ex:
+            self._retrieval_counts['rewrite_fallbacks'] += 1
             logger.warning(f"查询改写失败，使用原始查询: {ex}")
             return [query]
 
@@ -321,9 +365,19 @@ class MCPToolManager:
 
         这是解决"检索不全、召回不好"的完整方案。
         """
+        from observability.telemetry import get_telemetry
+        with get_telemetry().span('retrieval', kind='retriever',
+                                  metadata=self.retrieval_snapshot()) as observation:
+            result = await self._search_with_rewrite(tool_name, query, top_k, context)
+            observation.update(metadata={'success': result.success, 'reranked': result.reranked,
+                                         'result_count': len(result.data or [])})
+            return result
+
+    async def _search_with_rewrite(self, tool_name, query, top_k, context):
+        self._retrieval_counts['searches'] += 1
         # 1. 查询改写：生成多角度子查询
         sub_queries = await self.rewrite_query(query, n=3)
-        logger.info(f"查询改写: {query!r} → {sub_queries}")
+        logger.info('查询改写: policy=%s sub_queries=%d', self._rewrite_policy, len(sub_queries))
 
         # 2. 并行召回：所有子查询同时检索
         recall_k = max(top_k, 5)
@@ -333,34 +387,50 @@ class MCPToolManager:
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # 3. 合并去重（按内容哈希去重）
+        # 3. 合并去重：优先使用版本/切片级 evidence_id，旧数据忽略检索分数。
         seen, merged = set(), []
         for r in results:
             if isinstance(r, ToolResult) and r.success and isinstance(r.data, list):
                 for item in r.data:
-                    key = hashlib.md5(str(item).encode()).hexdigest()
+                    key = self._evidence_key(item)
                     if key not in seen:
                         seen.add(key)
                         merged.append(item)
 
+        self._retrieval_counts['candidate_count'] += len(merged)
+        logger.info('检索候选: queries=%d unique_candidates=%d', len(sub_queries), len(merged))
         if not merged:
             return ToolResult(success=False, data=[], tool_name=tool_name, error="所有子查询均无结果")
 
         # 4. 重排：用 LLM 对合并结果按相关性打分，取 Top-K
-        reranked = await self._rerank(query, merged, top_k)
-        return ToolResult(success=True, data=reranked, tool_name=tool_name, reranked=True)
+        ranked, reranked = await self._rerank_with_status(query, merged, top_k)
+        return ToolResult(success=True, data=ranked, tool_name=tool_name, reranked=reranked)
+
+    @staticmethod
+    def _evidence_key(item):
+        if isinstance(item, dict):
+            if item.get('evidence_id'):
+                return item['evidence_id']
+            item = {key: value for key, value in item.items()
+                    if key not in {'score', 'distance', 'rerank_score'}}
+        return json.dumps(item, sort_keys=True, ensure_ascii=True, default=str)
 
     # ── 结果重排（解决召回不好）──────────────────────────────────────────────
 
     async def _rerank(self, query: str, items: List[Any], top_k: int) -> List[Any]:
+        """Compatibility wrapper; callers needing status use the explicit tuple."""
+        result, _ = await self._rerank_with_status(query, items, top_k)
+        return result
+
+    async def _rerank_with_status(self, query: str, items: List[Any], top_k: int) -> Tuple[List[Any], bool]:
         """
         用 LLM 对召回结果重新打分排序。
 
         解决问题：向量检索的相似度分数不等于"对用户有用"，
         LLM 能理解语义相关性，重排后 Top-K 质量显著提升。
         """
-        if len(items) <= top_k:
-            return items
+        if not self._should_rerank(len(items), top_k):
+            return items[:top_k], False
 
         # 将结果序列化为文本供 LLM 评分
         items_text = "\n".join(f"{i}. {json.dumps(item, ensure_ascii=False)[:200]}"
@@ -375,18 +445,24 @@ class MCPToolManager:
         prompt = self._clean_text(prompt)
 
         try:
-            resp = await self._client.messages.create(
-                model=self._model, max_tokens=256, temperature=0.0,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = extract_text_content(resp.content)
-            s, e = raw.find("["), raw.rfind("]") + 1
-            order: List[int] = json.loads(raw[s:e])
-            reranked = [items[i] for i in order if 0 <= i < len(items)]
-            return reranked[:top_k]
+            from observability.telemetry import get_telemetry
+            self._retrieval_counts['rerank_calls'] += 1
+            with get_telemetry().span('retrieval.rerank', kind='generation',
+                                      metadata={'policy': self._rerank_policy, 'candidate_count': len(items)}) as observation:
+                resp = await asyncio.wait_for(self._client.messages.create(
+                    model=self._model, max_tokens=256, temperature=0.0,
+                    messages=[{"role": "user", "content": prompt}],
+                    **structured_request_options(),
+                ), timeout=self._retrieval_timeout_s)
+            order: List[int] = parse_structured_response(resp, list)
+            if (not isinstance(order, list) or any(type(i) is not int for i in order)
+                    or len(order) != len(items) or set(order) != set(range(len(items)))):
+                raise ValueError('Rerank must return a complete permutation')
+            return [items[i] for i in order[:top_k]], True
         except Exception as ex:
+            self._retrieval_counts['rerank_fallbacks'] += 1
             logger.warning(f"重排失败，返回原始顺序: {ex}")
-            return items[:top_k]
+            return items[:top_k], False
 
     # ── 缓存 ──────────────────────────────────────────────────────────────────
 

@@ -12,13 +12,15 @@ Python 多 Agent 客服系统 · Vue 可视化工作台
 ![Redis](https://img.shields.io/badge/Memory-Redis-DC382D?logo=redis&logoColor=white)
 ![ChromaDB](https://img.shields.io/badge/RAG-ChromaDB-F2B544)
 
-[快速开始](#快速开始) · [架构说明](docs/architecture.md) · [开发指南](docs/development.md) · [项目来源](docs/provenance.md)
+[快速开始](#快速开始) · [架构说明](docs/architecture.md) · [场景评测](docs/evaluation.md) · [开发指南](docs/development.md) · [项目来源](docs/provenance.md)
 
 </div>
 
 EchoMind 面向客服与运营问题，将意图识别、知识检索、专业 Agent 协作和会话记忆串成完整链路。前端提供对话、知识库和评测工作台，并展示主 Agent、路由原因、工具调用与响应耗时。
 
 本仓库整理了 **Python 后端 + Vue 前端** 的实现，适合本地演示、代码阅读与进一步开发。
+
+**跨电脑接续开发：先读 [交接入口](docs/CONTINUE_HERE.md)。** 包含当前完成/未完成事项、新机环境恢复命令、候选集状态和下一步执行顺序。
 
 ## 能力一览
 
@@ -30,7 +32,7 @@ EchoMind 面向客服与运营问题，将意图识别、知识检索、专业 A
 | RAG | ChromaDB 文档检索、查询改写、并行召回、LLM 重排、缓存与熔断 |
 | 分层记忆 | Redis 工作记忆、ChromaDB 历史记忆与用户画像 |
 | 动态 Skills | 从 Markdown 业务规则加载能力说明并注入 Agent |
-| 可观测与评测 | 在线监控摘要、Prometheus 指标、意图评测、LLM Judge 与基线回归 |
+| 可观测与评测 | 完整对话链路、120 条合成场景、证据 Judge、冻结基线、配对实验与可选 Langfuse |
 
 ## 请求如何流转
 
@@ -53,7 +55,7 @@ flowchart LR
 
 ## 快速开始
 
-准备 Docker Compose、Node.js **20.19+ 或 22.12+**，以及能调用 Anthropic Messages 协议的模型服务和 API Key。后端镜像使用 Python 3.12；真实对话与评测会调用所配置的模型。
+准备 Docker Compose、Node.js **20.19+ 或 22.12+**，以及能调用 Anthropic Messages 协议的模型服务和 API Key。后端镜像使用 Python 3.12；真实对话和 live 回放会调用所配置的模型，默认场景数据校验不调用模型。
 
 ### 1. 启动 Python 后端
 
@@ -91,7 +93,7 @@ npm run dev
 1. 在工作台检查连接，发送“登录时报 401，同时订单被重复扣款”。
 2. 查看主 Agent、辅助 Agent、路由原因与工具轨迹。
 3. 在知识库中添加一条明确标注为演示的业务政策，再搜索相关问题。
-4. 在评测页面运行内置用例，查看本次结果。
+4. 在评测页面校验场景数据；配置模型后显式选择真实回放，查看逐项结果、历史与实验比较。
 
 新实例会自动加载内置演示知识，也可以通过工作台导入自己的文档。仓库不包含原环境的对话、画像、数据库或评测基线。
 

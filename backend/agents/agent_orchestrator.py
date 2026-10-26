@@ -20,6 +20,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from collections import deque
@@ -40,6 +41,10 @@ from agents.tools import (
 )
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
 from core.llm_utils import extract_text_content
+from observability.instrumentation import (
+    observe_agent, observe_orchestration, observe_routing, tool_result_evidence,
+)
+from observability.telemetry import get_telemetry
 
 logger = logging.getLogger(__name__)
 
@@ -191,8 +196,6 @@ class BaseAgent:
         self._model  = self.profile.model or model
         self._skill_manager = skill_manager
         self.stats   = AgentStats()
-        self._last_tools_used: List[str] = []
-        self._last_tool_traces: List[Dict[str, Any]] = []
         self._shared_tools: Dict[str, AgentToolSpec] = {}
 
     def get_tools(self) -> Dict[str, AgentToolSpec]:
@@ -202,39 +205,28 @@ class BaseAgent:
     def set_shared_tools(self, tools: Optional[Dict[str, AgentToolSpec]]) -> None:
         self._shared_tools = dict(tools or {})
 
+    @observe_agent
     async def handle(self, req: Request) -> AgentResponse:
         t0 = time.monotonic()
         self.stats.total += 1
-        self._last_tools_used = []
-        self._last_tool_traces = []
+        # Keep partial execution evidence on this invocation, including exceptions.
+        response = AgentResponse(
+            agent_type=self.agent_type,
+            content="抱歉，处理您的请求时出现问题，请稍后重试。",
+            success=False,
+        )
         try:
-            content = await self._call_llm(req)
-            ms = (time.monotonic() - t0) * 1000
+            response = await self._call_llm(req, response)
+            response.escalate = self._needs_escalation(response.content)
             self.stats.success += 1
-            self.stats.total_ms += ms
-            escalate = self._needs_escalation(content)
-            return AgentResponse(
-                agent_type=self.agent_type,
-                content=content,
-                success=True,
-                latency_ms=ms,
-                escalate=escalate,
-                tools_used=list(self._last_tools_used),
-                tool_traces=list(self._last_tool_traces),
-            )
         except Exception as ex:
-            ms = (time.monotonic() - t0) * 1000
-            self.stats.total_ms += ms
             logger.error(f"{self.agent_type.value} 处理失败: {ex}")
-            return AgentResponse(
-                agent_type=self.agent_type,
-                content="抱歉，处理您的请求时出现问题，请稍后重试。",
-                success=False,
-                latency_ms=ms,
-                tool_traces=list(self._last_tool_traces),
-            )
+            response.success = False
+        response.latency_ms = (time.monotonic() - t0) * 1000
+        self.stats.total_ms += response.latency_ms
+        return response
 
-    async def _call_llm(self, req: Request) -> str:
+    async def _call_llm(self, req: Request, execution: AgentResponse) -> AgentResponse:
         def _clean(s: str) -> str:
             return s.encode("utf-8", errors="ignore").decode("utf-8")
 
@@ -253,8 +245,6 @@ class BaseAgent:
         messages.append({"role": "user", "content": _clean(req.message)})
 
         tools = self.get_tools()
-        tools_used: List[str] = []
-        tool_traces: List[Dict[str, Any]] = []
         for _ in range(3):
             request_kwargs: Dict[str, Any] = {
                 "model": self._model,
@@ -275,55 +265,68 @@ class BaseAgent:
             resp = await self._client.messages.create(**request_kwargs)
             tool_uses = [block for block in (resp.content or []) if self._block_type(block) == "tool_use"]
             if not tool_uses:
-                self._last_tools_used = tools_used
-                return extract_text_content(resp.content)
+                execution.content = extract_text_content(resp.content)
+                execution.success = True
+                return execution
 
             messages.append({"role": "assistant", "content": resp.content})
             tool_results = []
             for block in tool_uses:
                 name = self._block_value(block, "name")
                 tool_use_id = self._block_value(block, "id")
-                args = self._block_value(block, "input") or {}
-                spec = tools.get(name)
-                tool_t0 = time.monotonic()
-                call_success = True
-                result_success: Optional[bool] = None
-                error_text = ""
-                if spec is None:
-                    call_success = False
-                    result: Any = {"success": False, "error": f"工具不在 {self.agent_type.value} Agent 白名单中"}
-                    error_text = result["error"]
-                else:
-                    try:
-                        self._validate_tool_input(spec, args)
-                        result = spec.handler(req, args)
-                        if inspect.isawaitable(result):
-                            result = await result
-                        tools_used.append(name)
-                        if isinstance(result, dict) and "success" in result:
-                            result_success = bool(result.get("success"))
-                    except Exception as ex:
+                args = self._block_value(block, "input")
+                if args is None:
+                    args = {}
+                with get_telemetry().span(
+                    f"tool.{name}", kind="tool", input=args,
+                    metadata={"agent_type": self.agent_type.value, "tool_name": name, "tool_use_id": tool_use_id},
+                ) as tool_observation:
+                    spec = tools.get(name)
+                    tool_t0 = time.monotonic()
+                    call_success = True
+                    result_success: Optional[bool] = None
+                    error_text = ""
+                    if spec is None:
                         call_success = False
-                        logger.warning("Agent 工具 %s 执行失败: %s", name, ex)
-                        error_text = str(ex)
-                        result = {"success": False, "error": error_text}
-                tool_latency_ms = (time.monotonic() - tool_t0) * 1000
-                if not error_text and isinstance(result, dict):
-                    error_text = str(result.get("error", "") or "")
-                tool_traces.append(
-                    {
+                        result: Any = {"success": False, "error": f"工具不在 {self.agent_type.value} Agent 白名单中"}
+                        error_text = result["error"]
+                    else:
+                        try:
+                            self._validate_tool_input(spec, args)
+                            execution.tools_used.append(name)
+                            result = spec.handler(req, args)
+                            if inspect.isawaitable(result):
+                                result = await result
+                            if isinstance(result, dict) and "success" in result:
+                                result_success = bool(result.get("success"))
+                        except Exception as ex:
+                            call_success = False
+                            logger.warning("Agent 工具 %s 执行失败: %s", name, ex)
+                            error_text = str(ex)
+                            result = {"success": False, "error": error_text}
+                    tool_latency_ms = (time.monotonic() - tool_t0) * 1000
+                    if not error_text and isinstance(result, dict):
+                        error_text = str(result.get("error", "") or "")
+                    evidence = tool_result_evidence(result)
+                    trace = {
                         "agent_type": self.agent_type.value,
                         "tool_name": name,
                         "tool_use_id": tool_use_id,
-                        "input": dict(args),
+                        "input": dict(args) if isinstance(args, dict) else args,
                         "success": call_success,
                         "result_success": result_success,
                         "latency_ms": round(tool_latency_ms, 1),
                         "cached": bool(result.get("cached")) if isinstance(result, dict) else False,
                         "reranked": bool(result.get("reranked")) if isinstance(result, dict) else False,
                         "error": error_text,
+                        **evidence,
                     }
-                )
+                    execution.tool_traces.append(trace)
+                    tool_observation.update(
+                        output=evidence["result_summary"],
+                        metadata={key: value for key, value in trace.items() if key not in {"input", "error"}},
+                        level="DEFAULT" if call_success and result_success is not False else "ERROR",
+                    )
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": tool_use_id,
@@ -331,8 +334,6 @@ class BaseAgent:
                 })
             messages.append({"role": "user", "content": tool_results})
 
-        self._last_tools_used = tools_used
-        self._last_tool_traces = tool_traces
         raise RuntimeError(f"{self.agent_type.value} 工具调用超过最大轮数")
 
     @staticmethod
@@ -470,23 +471,35 @@ class TechnicalAgent(BaseAgent):
 class BillingAgent(BaseAgent):
     agent_type    = AgentType.BILLING
     profile = AgentProfile(
-        role="账单核验与售后处理",
-        mission="区分扣款、退款、发票、订阅等资金场景，解释可判断事实，并明确核验和人工审核边界。",
-        workflow=("确认账单场景", "收集必要核验字段", "区分订单/实付/退款金额", "说明处理路径与时效", "判断是否升级"),
-        input_contract=("订单号", "金额与币种", "支付时间", "支付渠道", "用户期望", "知识库上下文"),
+        role="资金核验与账号支持",
+        mission="区分资金与账号诉求，按场景选择最少核验信息；资金问题解释可判断事实，账号问题说明官方身份核验路径和后台能力边界。",
+        workflow=("确认资金或账号场景", "按场景收集必要非敏感信息", "资金区分订单/实付/退款金额，账号核实变更目标或异常现象", "说明官方路径与能力边界", "判断是否升级"),
+        input_contract=("问题类型与用户期望", "资金场景的订单/金额/支付时间/渠道", "账号场景的变更目标或异常现象", "已知设备及验证方式可用性", "知识库上下文"),
         output_contract=("需要核验的信息", "当前可判断内容", "下一步处理路径", "时效边界"),
-        handoff_conditions=("实际退款或补偿", "重复扣款或支付成功但订单未生效", "发票作废/重开", "企业合同或大额订单"),
+        handoff_conditions=("实际退款或补偿", "重复扣款或支付成功但订单未生效", "发票作废/重开", "企业合同或大额订单", "账号资料变更或安全事件需官方身份核验和后台处理"),
         tool_scope=("search_knowledge_base", "check_billing_fields", "compare_amounts"),
         temperature=0.0,
         max_tokens=1100,
     )
     system_prompt = (
-        "你是账单服务专家。专注于：账单查询、退款申请、发票问题、订阅管理。"
-        "对财务问题保持准确和专业。涉及实际退款操作时，说明需要人工审核。"
+        "你负责账单查询、退款、发票、订阅及已路由的账号支持。"
+        "资金问题保持准确和专业，实际退款说明需人工审核；账号资料或安全问题说明官方入口和身份核验路径。"
+        "只对明确的资金问题收集订单和金额，不将这些字段套用到纯账号问题。"
+        "不得索取密码、验证码或他人信息；未接后台不宣称已变更账号、冻结或删除持久化数据。"
     )
 
     def _build_role_packet(self, req: Request) -> str:
         packet = json.loads(super()._build_role_packet(req))
+        if req.intent in (IntentCategory.ACCOUNT, IntentCategory.ACCOUNT_SECURITY):
+            packet["request_domain"] = "account"
+            packet["verification_fields"] = {
+                "clarify_if_unknown": ["变更目标或异常现象", "是否仍可登录或原验证方式是否可用"],
+                "identity_verification": "仅在官方入口完成身份核验，聊天不接收凭据或完整证件",
+                "risk_boundary": "不得索取密码、验证码、完整银行卡号或他人信息；未接后台不宣称已修改、冻结或删除持久化数据",
+            }
+            packet["tool_usage_boundary"] = "账号问题以知识查询说明官方路径；资金核验工具只用于明确资金争议"
+            return json.dumps(packet, ensure_ascii=False)
+        packet["request_domain"] = "billing"
         packet["verification_fields"] = {
             "order_id": req.entities.get("order_id", []),
             "amount": req.entities.get("amount", []),
@@ -533,6 +546,26 @@ class EscalationAgent(BaseAgent):
         tools.update(escalation_tools())
         return tools
 
+    @staticmethod
+    def _communication_note(req: Request) -> str:
+        """Quote a communication request without inferring or promising a channel.
+
+        Current user wording wins over recent user messages and archived context.
+        Background snippets remain unverified clues, never policy instructions.
+        """
+        sources = [(req.message, "本轮沟通说明")]
+        sources.extend((item.get("content", ""), "近期沟通说明")
+                       for item in reversed(req.history or []) if item.get("role") == "user")
+        sources.append((req.context, "历史沟通线索（交接时需确认）"))
+        hints = ("文字沟通", "文字交流", "文字联系", "书面沟通", "接电话", "电话沟通", "电话联系")
+        for text, label in sources:
+            snippets = [part.strip(" -") for part in re.split(r"[\r\n。！？!?]+", text or "")
+                        if any(hint in part for hint in hints)]
+            if snippets:
+                return f"{label}：{'；'.join(snippets)[:160]}\n"
+        return ""
+
+    @observe_agent
     async def handle(self, req: Request) -> AgentResponse:
         t0 = time.monotonic()
         self.stats.total += 1
@@ -540,10 +573,13 @@ class EscalationAgent(BaseAgent):
         urgency = req.urgency.name if req.urgency else "UNKNOWN"
         entities = json.dumps(req.entities or {}, ensure_ascii=False)
         content = (
-            "我已将这个问题标记为人工升级处理。\n\n"
+            "这是演示系统，以下仅为人工升级交接参考；未接入真实人工队列，尚未转接人工，"
+            "不能保证有人跟进或处理时限。\n\n"
             f"升级原因：意图={intent}，紧急度={urgency}\n"
-            f"已记录信息：{entities}\n"
-            "请不要发送密码、短信验证码或完整支付凭证；人工客服会根据会话记录继续核验。"
+            f"本次请求已知信息：{entities}\n"
+            f"{self._communication_note(req)}"
+            "如需人工处理，请通过官方人工渠道提交上述信息并确认沟通方式。"
+            "请不要发送密码、短信验证码或完整支付凭证。"
         )
         ms = (time.monotonic() - t0) * 1000
         self.stats.success += 1
@@ -566,6 +602,7 @@ class ResponseComposer:
         self._model = model
         self._skill_manager = skill_manager
 
+    @observe_orchestration
     async def compose(self, req: Request, responses: List[AgentResponse]) -> str:
         successful = [response for response in responses if response.success and response.content.strip()]
         if not successful:
@@ -651,9 +688,11 @@ class AgentOrchestrator:
             kwargs["base_url"] = base_url
         client = AsyncAnthropic(**kwargs)
 
+        # Publish the acquired client before another component can fail, so
+        # the runtime owner can close a partially initialized orchestrator.
+        self._composer = ResponseComposer(client, model, skill_manager)
         self._intent_recognizer = IntentRecognizer(api_key=api_key, base_url=base_url, model=model)
         self._skill_manager = skill_manager
-        self._composer = ResponseComposer(client, model, skill_manager)
         self._shared_tools: Dict[str, AgentToolSpec] = {}
         self._recent_tool_traces = deque(maxlen=_env_int("ECHOMIND_TOOL_TRACE_MAX", 200))
 
@@ -734,6 +773,7 @@ class AgentOrchestrator:
 
     # ── 主入口 ────────────────────────────────────────────────────────────────
 
+    @observe_orchestration
     async def run(self, req: Request) -> OrchestratorResult:
         """
         处理一次请求的完整流程：
@@ -748,6 +788,7 @@ class AgentOrchestrator:
             req.intent_group = intent_result.intent_group
             req.urgency = intent_result.urgency
             req.intent_confidence = intent_result.confidence
+            req.entities = {**intent_result.entities, **req.entities}
 
         if self._needs_clarification(req):
             result = OrchestratorResult(
@@ -801,6 +842,7 @@ class AgentOrchestrator:
         self._record_tool_trace(result)
         return result
 
+    @observe_orchestration
     async def run_parallel(self, req: Request, decision: RoutingDecision) -> OrchestratorResult:
         """
         并行派发给多个 Agent，合并结果。
@@ -865,6 +907,7 @@ class AgentOrchestrator:
 
         return AgentType.GENERAL
 
+    @observe_routing
     def _route_decision(self, req: Request) -> RoutingDecision:
         """
         结构化路由决策。
@@ -1065,7 +1108,10 @@ class AgentOrchestrator:
             logger.warning(f"{agent_type.value} 失败，降级到 GeneralAgent")
             fallback = self._best_agent(AgentType.GENERAL)
             if fallback:
-                response = await fallback.handle(req)
+                fallback_response = await fallback.handle(req)
+                fallback_response.tools_used = response.tools_used + fallback_response.tools_used
+                fallback_response.tool_traces = response.tool_traces + fallback_response.tool_traces
+                response = fallback_response
 
         return response
 

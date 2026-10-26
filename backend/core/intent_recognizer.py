@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
 
-from core.llm_utils import extract_text_content
+from core.llm_utils import parse_structured_response, structured_request_options
 
 logger = logging.getLogger(__name__)
 
@@ -271,10 +271,9 @@ class IntentRecognizer:
                 max_tokens=256,
                 temperature=0.1,
                 messages=[{"role": "user", "content": prompt}],
+                **structured_request_options(),
             )
-            raw = extract_text_content(resp.content)
-            s, e = raw.find("{"), raw.rfind("}") + 1
-            data = json.loads(raw[s:e])
+            data = parse_structured_response(resp, dict)
             try:
                 data["intent"] = IntentCategory(data["intent"])
             except ValueError:
@@ -304,6 +303,16 @@ class IntentRecognizer:
     def _pattern_recognize(self, message: str) -> Dict[str, Any]:
         """策略 3：关键词模式匹配（同步，零延迟兜底）。"""
         msg = message.lower()
+        # A compensation amount is not an HTTP status. Keep a real 500 in the
+        # same message visible, while excluding currency and larger numbers.
+        status_text = re.sub(
+            r"[¥￥$]\s*\d+(?:,\d{3})*(?:\.\d+)?"
+            r"|\d+(?:,\d{3})*(?:\.\d+)?\s*(?:元|块|人民币|美元|(?:rmb|cny|usd)(?![a-z]))",
+            "", msg,
+        )
+        crash_patterns = ["崩溃", "闪退", "报错", "crash"]
+        if re.search(r"(?<![\d.])500(?![\d.])", status_text):
+            crash_patterns.append("500")
         specific_patterns = {
             IntentCategory.HUMAN_HANDOFF: ["转人工", "人工客服", "找人工"],
             IntentCategory.ORDER_STATUS: ["订单状态", "发货了吗", "处理到哪", "order status"],
@@ -311,9 +320,12 @@ class IntentRecognizer:
             IntentCategory.REFUND: ["退款", "退货", "refund", "return"],
             IntentCategory.INVOICE: ["发票", "抬头", "税号", "invoice"],
             IntentCategory.PAYMENT_ISSUE: ["重复扣款", "多扣", "支付失败", "扣费", "payment failed"],
-            IntentCategory.ACCOUNT_SECURITY: ["被盗", "异常登录", "重置密码", "两步验证", "安全"],
+            # "安全更换资料" describes how to do an account task, not an event.
+            # Refine only explicit security events or named security functions.
+            IntentCategory.ACCOUNT_SECURITY: ["被盗", "异常登录", "重置密码", "两步验证",
+                                               "账户安全", "账号安全", "安全设置"],
             IntentCategory.TECHNICAL_LOGIN: ["无法登录", "登录失败", "401", "验证码"],
-            IntentCategory.TECHNICAL_CRASH: ["崩溃", "闪退", "500", "报错", "crash"],
+            IntentCategory.TECHNICAL_CRASH: crash_patterns,
         }
         generic_patterns = {
             IntentCategory.ESCALATION: ["投诉", "经理", "supervisor"],

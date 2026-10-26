@@ -26,6 +26,7 @@ __pycache__/
 .pytest_cache/
 .coverage
 htmlcov/
+backend/evaluation/reports/
 
 # Editors and operating systems
 .idea/

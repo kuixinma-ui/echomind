@@ -27,7 +27,13 @@ General 负责通用分流，Technical 负责技术排障，Billing 负责账单
 
 Redis 保存短期工作记忆；ChromaDB 保存知识片段、历史记忆和用户画像。Compose 同时定义了独立 Chroma 服务，而实现也支持本地持久化回退，实际使用方式取决于连接状态与配置。镜像会预下载 Chroma 默认 ONNX embedding 模型。
 
-Prometheus 抓取 API 的 `/metrics`。`PROMETHEUS_PORT` 非零时监控组件注册 Agent/工具指标；`/monitor` 提供工作台所用的运行摘要。评测接口使用当前模型产生结果，评测基线在运行时生成。
+Prometheus 抓取 API 的 `/metrics`。`PROMETHEUS_PORT` 非零时监控组件注册 Agent/工具指标；`/monitor` 提供工作台所用的运行摘要。场景数据校验默认不调用模型，真实回放使用独立 Runtime；基线仅在显式提升后生成。
+
+## 场景执行与观测
+
+API 与评测复用 `services/chat_service.py` 的完整链路。异步 Runtime 工厂负责资源所有权与失败回滚，评测空间使用唯一 `eval_<uuid>`；跨会话历史显式归档后才验证召回。规则和有证据 Judge 分层评分，报告只追加保存，比较时声明变化因素并固定控制条件。
+
+`observability/` 提供可选 Langfuse 适配与真实模型用量计数；默认不启用外部导出。ContextRef、记忆差异和检索策略支持后续上下文实验。操作说明和验证边界见 [场景评测指南](evaluation.md)。
 
 ## 前端
 

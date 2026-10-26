@@ -1,0 +1,18 @@
+# Optional integration image. The existing production Dockerfile is unchanged.
+FROM python:3.12-slim AS dependencies
+WORKDIR /app
+ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+COPY requirements.txt requirements-observability.txt ./
+RUN pip install -r requirements.txt -r requirements-observability.txt
+
+FROM python:3.12-slim
+WORKDIR /app
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/app
+COPY --from=dependencies /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=dependencies /usr/local/bin /usr/local/bin
+RUN useradd -m -u 1000 echomind
+COPY --chown=echomind:echomind . .
+RUN mkdir -p /app/data/integration /app/data/eval /app/data/chroma-fallback /home/echomind/.cache/chroma && \
+    chown -R echomind:echomind /app/data /home/echomind/.cache
+USER echomind
+CMD ["python", "-m", "evaluation.integration", "--output-dir", "data/integration"]

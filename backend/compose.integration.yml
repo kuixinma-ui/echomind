@@ -1,0 +1,241 @@
+# Isolated local integration stack. Run with --env-file .env.integration.
+# Source: Langfuse v4.70.0 official Compose; local-only ports and separate data.
+name: echomind-integration
+
+x-common: &common
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+x-langfuse-env: &langfuse-env
+  NEXTAUTH_URL: http://localhost:${INTEGRATION_LANGFUSE_PORT:-13000}
+  DATABASE_URL: postgresql://langfuse:${INTEGRATION_POSTGRES_PASSWORD:?Generate .env.integration first}@lf-postgres:5432/langfuse
+  SALT: ${INTEGRATION_LANGFUSE_SALT:?Generate .env.integration first}
+  ENCRYPTION_KEY: ${INTEGRATION_LANGFUSE_ENCRYPTION_KEY:?Generate .env.integration first}
+  TELEMETRY_ENABLED: "false"
+  CLICKHOUSE_MIGRATION_URL: clickhouse://lf-clickhouse:9000
+  CLICKHOUSE_URL: http://lf-clickhouse:8123
+  CLICKHOUSE_USER: langfuse
+  CLICKHOUSE_PASSWORD: ${INTEGRATION_CLICKHOUSE_PASSWORD:?Generate .env.integration first}
+  CLICKHOUSE_CLUSTER_ENABLED: "false"
+  REDIS_HOST: lf-redis
+  REDIS_PORT: "6379"
+  REDIS_AUTH: ${INTEGRATION_LANGFUSE_REDIS_PASSWORD:?Generate .env.integration first}
+  REDIS_TLS_ENABLED: "false"
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: langfuse
+  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${INTEGRATION_MINIO_PASSWORD:?Generate .env.integration first}
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://lf-minio:9000
+  LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+  LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+  LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: langfuse
+  LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${INTEGRATION_MINIO_PASSWORD:?Generate .env.integration first}
+  LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://lf-minio:9000
+  LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+  LANGFUSE_S3_BATCH_EXPORT_ENABLED: "false"
+
+x-langfuse-depends: &langfuse-depends
+  lf-postgres:
+    condition: service_healthy
+  lf-clickhouse:
+    condition: service_healthy
+  lf-minio:
+    condition: service_healthy
+  lf-redis:
+    condition: service_healthy
+
+services:
+  redis:
+    <<: *common
+    image: ${INTEGRATION_REDIS_IMAGE:-redis:7.4.2-alpine@sha256:02419de7eddf55aa5bcf49efb74e88fa8d931b4d77c07eff8a6b2144472b6952}
+    command: [redis-server, --appendonly, "yes", --maxmemory-policy, noeviction, --requirepass, "${INTEGRATION_REDIS_PASSWORD:?Generate .env.integration first}"]
+    environment:
+      REDISCLI_AUTH: ${INTEGRATION_REDIS_PASSWORD:?Generate .env.integration first}
+    ports:
+      - "127.0.0.1:${INTEGRATION_REDIS_PORT:-16379}:6379"
+    volumes:
+      - evaluation-redis:/data
+    healthcheck:
+      test: [CMD, redis-cli, --no-auth-warning, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  chromadb:
+    <<: *common
+    image: ${INTEGRATION_CHROMA_IMAGE:-chromadb/chroma:0.5.23@sha256:18e67eecc172abbcd9413d751bde64983b3d167fe497c98f979083eb24c0c942}
+    environment:
+      IS_PERSISTENT: "TRUE"
+      PERSIST_DIRECTORY: /chroma/chroma
+      ANONYMIZED_TELEMETRY: "FALSE"
+    ports:
+      - "127.0.0.1:${INTEGRATION_CHROMA_PORT:-18001}:8000"
+    volumes:
+      - evaluation-chroma:/chroma/chroma
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/heartbeat', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 12
+
+  lf-postgres:
+    <<: *common
+    profiles: [langfuse]
+    image: ${INTEGRATION_POSTGRES_IMAGE:-postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94}
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: ${INTEGRATION_POSTGRES_PASSWORD:?Generate .env.integration first}
+      POSTGRES_DB: langfuse
+      TZ: UTC
+      PGTZ: UTC
+    volumes:
+      - langfuse-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD, pg_isready, -U, langfuse, -d, langfuse]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  lf-clickhouse:
+    <<: *common
+    profiles: [langfuse]
+    image: ${INTEGRATION_CLICKHOUSE_IMAGE:-clickhouse/clickhouse-server:25.12@sha256:8a790dd3468db22b1d4e7b18a176f378ff5ff6053b9c48dd4ea1fa71a24c5ba6}
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: langfuse
+      CLICKHOUSE_PASSWORD: ${INTEGRATION_CLICKHOUSE_PASSWORD:?Generate .env.integration first}
+    volumes:
+      - langfuse-clickhouse:/var/lib/clickhouse
+      - langfuse-clickhouse-logs:/var/log/clickhouse-server
+    healthcheck:
+      test: [CMD-SHELL, "wget --no-verbose --tries=1 --spider http://127.0.0.1:8123/ping || exit 1"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 20
+
+  lf-redis:
+    <<: *common
+    profiles: [langfuse]
+    image: ${INTEGRATION_REDIS_IMAGE:-redis:7.4.2-alpine@sha256:02419de7eddf55aa5bcf49efb74e88fa8d931b4d77c07eff8a6b2144472b6952}
+    command: [redis-server, --appendonly, "yes", --maxmemory-policy, noeviction, --requirepass, "${INTEGRATION_LANGFUSE_REDIS_PASSWORD:?Generate .env.integration first}"]
+    environment:
+      REDISCLI_AUTH: ${INTEGRATION_LANGFUSE_REDIS_PASSWORD:?Generate .env.integration first}
+    volumes:
+      - langfuse-redis:/data
+    healthcheck:
+      test: [CMD, redis-cli, --no-auth-warning, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  lf-minio:
+    <<: *common
+    profiles: [langfuse]
+    # Resolved from the official Compose's chainguard/minio:latest on 2026-10-26.
+    image: ${INTEGRATION_MINIO_IMAGE:-cgr.dev/chainguard/minio@sha256:268d68a2a3b6fc65f905a61f84d7eab6345ce6bff14f551e2b028ec31e6a1341}
+    entrypoint: sh
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: langfuse
+      MINIO_ROOT_PASSWORD: ${INTEGRATION_MINIO_PASSWORD:?Generate .env.integration first}
+    ports:
+      - "127.0.0.1:${INTEGRATION_MINIO_PORT:-19090}:9000"
+    volumes:
+      - langfuse-minio:/data
+    healthcheck:
+      test: [CMD, mc, ready, local]
+      interval: 5s
+      timeout: 5s
+      start_period: 10s
+      retries: 20
+
+  langfuse-worker:
+    <<: *common
+    profiles: [langfuse]
+    image: ${INTEGRATION_LANGFUSE_WORKER_IMAGE:-docker.langfuse.com/langfuse/langfuse-worker:4.70.0@sha256:3b3b204fa72fd02d010ab90c667d07281e4b9ec3b5b0b1d21470ac2624b8a564}
+    depends_on: *langfuse-depends
+    environment: *langfuse-env
+    healthcheck:
+      test: [CMD-SHELL, 'wget --quiet --spider "http://$${HOSTNAME}:3030/api/health"']
+      interval: 15s
+      timeout: 10s
+      start_period: 90s
+      retries: 20
+
+  langfuse-web:
+    <<: *common
+    profiles: [langfuse]
+    image: ${INTEGRATION_LANGFUSE_WEB_IMAGE:-docker.langfuse.com/langfuse/langfuse:4.70.0@sha256:932a46dfab770f89ecb2ec35258b6b80d3be8773403981a64d271ff0a408deef}
+    depends_on: *langfuse-depends
+    environment:
+      <<: *langfuse-env
+      NEXTAUTH_SECRET: ${INTEGRATION_LANGFUSE_NEXTAUTH_SECRET:?Generate .env.integration first}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://localhost:${INTEGRATION_MINIO_PORT:-19090}
+      LANGFUSE_S3_MEDIA_UPLOAD_INTERNAL_ENDPOINT: http://lf-minio:9000
+    ports:
+      - "127.0.0.1:${INTEGRATION_LANGFUSE_PORT:-13000}:3000"
+    healthcheck:
+      test: [CMD-SHELL, 'wget --quiet --spider "http://$${HOSTNAME}:3000/api/public/health"']
+      interval: 15s
+      timeout: 10s
+      start_period: 120s
+      retries: 20
+
+  # One-shot CLI, not an API server. No paid request in the default command.
+  app:
+    profiles: [app]
+    build:
+      context: .
+      dockerfile: Dockerfile.observability
+    image: echomind-integration-observability:local
+    restart: "no"
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-https://api.anthropic.com}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-}
+      ECHOMIND_JUDGE_MODEL: ${ECHOMIND_JUDGE_MODEL:-}
+      REDIS_URL: redis://:${INTEGRATION_REDIS_PASSWORD:?Generate .env.integration first}@redis:6379/0
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: "8000"
+      CHROMA_PERSIST_DIRECTORY: /app/data/chroma-fallback
+      ECHOMIND_SKILLS_DIR: /app/skills
+      ECHOMIND_EVAL_REPORT_DIR: /app/data/eval/scenarios
+      ECHOMIND_QUERY_REWRITE_POLICY: ${ECHOMIND_QUERY_REWRITE_POLICY:-always}
+      ECHOMIND_RERANK_POLICY: ${ECHOMIND_RERANK_POLICY:-always}
+      ECHOMIND_RETRIEVAL_TIMEOUT_S: ${ECHOMIND_RETRIEVAL_TIMEOUT_S:-30}
+      ECHOMIND_TELEMETRY_ENABLED: ${ECHOMIND_TELEMETRY_ENABLED:-false}
+      ECHOMIND_TRACE_CONTENT: ${ECHOMIND_TRACE_CONTENT:-false}
+      ECHOMIND_TELEMETRY_HASH_SALT: ${ECHOMIND_TELEMETRY_HASH_SALT:-}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_BASE_URL: http://langfuse-web:3000
+    volumes:
+      - ./data/integration:/app/data/integration
+      - ./data/eval:/app/data/eval
+      - embedding-cache:/home/echomind/.cache/chroma
+    depends_on:
+      redis:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+    command: [python, -m, evaluation.integration, --output-dir, data/integration]
+
+volumes:
+  evaluation-redis:
+  evaluation-chroma:
+  langfuse-postgres:
+  langfuse-clickhouse:
+  langfuse-clickhouse-logs:
+  langfuse-redis:
+  langfuse-minio:
+  embedding-cache:
