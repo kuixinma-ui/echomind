@@ -29,6 +29,15 @@ async def _await(value):
 
 
 _MISSING = object()
+_USAGE_FIELDS = ('input_tokens', 'output_tokens', 'cache_read_input_tokens',
+                 'cache_creation_input_tokens', 'model_calls')
+
+
+def _usage_snapshot(value):
+    if not isinstance(value, dict):
+        return {}
+    return {name: value[name] for name in _USAGE_FIELDS
+            if type(value.get(name)) is int and value[name] >= 0}
 
 
 def _path(value, path):
@@ -215,6 +224,10 @@ class ScenarioRunner:
             try:
                 reply = await asyncio.wait_for(_await(runtime.service.chat(turn['message'], user, record['conv_id'],
                                                 wait_for_profile=True)), case['budgets'].get('turn_timeout_s', 120))
+                # Provider work remains observed even when the returned reply is unusable.
+                usage = _usage_snapshot(reply.get('usage')) if isinstance(reply, dict) else {}
+                if usage:
+                    record['usage'] = usage
                 if not isinstance(reply, dict) or not isinstance(reply.get('response'), str) or not reply['response'].strip():
                     raise ValueError('ChatService must return a nonempty actual response')
                 if not isinstance(reply.get('tool_traces', []), list):
@@ -261,6 +274,7 @@ class ScenarioRunner:
     async def _assert(self, rule, target, case, knowledge, turns, *, archived_sessions=None):
         kind = rule['type']
         status, reason, scores = 'failed', 'Assertion did not match actual service evidence', {}
+        annotations = {}
         try:
             if kind == 'semantic':
                 if self.judge is None:
@@ -280,6 +294,13 @@ class ScenarioRunner:
                     if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) or not 0 <= value <= 1:
                         raise ValueError(f'Invalid Judge score: {name}')
                     scores[name] = float(value)
+                judge_mode = values.get('judge_mode', 'scores')
+                if judge_mode not in ('scores', 'explained_v1'):
+                    raise ValueError('Invalid Judge mode')
+                if judge_mode == 'explained_v1' or values.get('explanations'):
+                    from evaluation.evaluator import validated_explanations
+                    explanations = validated_explanations(values.get('explanations'), evidence)
+                    annotations = {'judge_mode': judge_mode, 'explanations': explanations}
                 scores['overall'] = statistics.mean(scores.values())
                 passed = all(scores[name] >= rule.get('threshold', .75)
                              for name in ('relevance', 'accuracy', 'completeness', 'helpfulness'))
@@ -324,20 +345,21 @@ class ScenarioRunner:
                 status, reason = 'passed', 'Matched actual service evidence'
         except asyncio.TimeoutError:
             status, reason, scores = 'timeout', 'Judge timed out', {}
+            annotations = {}
         except Exception as exc:
             status, reason, scores = 'invalid', str(exc), {}
-        return {'status': status, 'reason': reason, 'scores': scores}
+            annotations = {}
+        return {'status': status, 'reason': reason, 'scores': scores, **annotations}
 
     @staticmethod
     def _usage(turns):
         totals, observed = {}, 0
         for turn in turns:
-            usage = turn.get('actual', {}).get('usage')
-            if isinstance(usage, dict):
+            usage = _usage_snapshot(turn.get('usage', turn.get('actual', {}).get('usage')))
+            if usage:
                 observed += 1
                 for name, value in usage.items():
-                    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
-                        totals[name] = totals.get(name, 0) + value
+                    totals[name] = totals.get(name, 0) + value
         return {'observed_turns': observed, 'totals': totals, 'status': 'observed' if observed else 'unavailable'}
 
     def _observe(self, report):
@@ -359,13 +381,17 @@ async def _live(args, dataset):
     if not config.get('api_key') or config['api_key'].strip().lower() in {'test', 'dummy', 'changeme', 'your-api-key'}:
         raise ValueError('A configured ANTHROPIC_API_KEY is required for explicit live replay')
     config['judge_enabled'] = args.judge
+    config['judge_mode'] = getattr(args, 'judge_mode', None) or config.get('judge_mode', 'scores')
+    if config['judge_mode'] not in ('scores', 'explained_v1'):
+        raise ValueError('Invalid Judge mode')
     judge, client = None, None
     if args.judge:
         from anthropic import AsyncAnthropic
         from evaluation.evaluator import LLMJudge
         from observability.instrumentation import AnthropicClientProxy
         client = AnthropicClientProxy(AsyncAnthropic(api_key=config['api_key'], **({'base_url': config['base_url']} if config.get('base_url') else {})))
-        judge = LLMJudge(client, config.get('judge_model', config['model']))
+        judge_options = {'mode': config['judge_mode']} if config['judge_mode'] != 'scores' else {}
+        judge = LLMJudge(client, config.get('judge_model', config['model']), **judge_options)
     try:
         async def factory(**kwargs):
             return await _await(create_runtime(config, **kwargs))
@@ -387,6 +413,8 @@ def main(argv=None):
     parser.add_argument('--dataset', default=str(DEFAULT_DATASET))
     parser.add_argument('--report-dir', default=str(DEFAULT_REPORT_DIR))
     parser.add_argument('--judge', action='store_true', help='Explicitly enable model-based semantic grading in live mode')
+    parser.add_argument('--judge-mode', choices=('scores', 'explained_v1'), default=None,
+                        help='Optional explicit Judge protocol; defaults to ECHOMIND_JUDGE_MODE or scores')
     parser.add_argument('--max-model-calls', type=int, help='Maximum SDK create attempts, including Judge/profile; internal HTTP retries are not counted')
     parser.add_argument('--max-model-seconds', type=float, help='Deadline for provider waits and new case starts; initialization/cleanup may take longer')
     parser.add_argument('--limit', type=int, default=5, help='Maximum live cases; defaults to five. Validation always checks all cases.')

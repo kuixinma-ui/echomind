@@ -177,31 +177,40 @@ def validate_dataset(dataset):
             'fingerprint': stable_hash(dataset)}
 
 
-def _tree_snapshot(root, pattern='*'):
+def _tree_snapshot(root, pattern='*', *, excluded_root_dirs=()):
     root = Path(root)
     if not root.exists():
         return {'missing': True}
     return {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
             for p in sorted(root.rglob(pattern)) if p.is_file()
+            and p.relative_to(root).parts[0] not in excluded_root_dirs
             and not {'__pycache__', '.git', 'reports', 'tests'} & set(p.relative_to(root).parts)}
 
 
 def build_fingerprints(dataset, config):
     """Hash actual local snapshots; never copy credentials or full config to reports."""
+    from mcp.knowledge_base import KnowledgeBase
     backend = Path(__file__).resolve().parents[1]
     skills = _tree_snapshot(config.get('skills_dir', backend / 'skills'))
     prompt = {'sources': {p.name: p.read_text(encoding='utf-8') for p in (backend / 'agents').glob('*.py')},
               'skills_max_prompt_chars': config.get('skills_max_prompt_chars', 5000)}
     structured = {'thinking': structured_thinking_policy(config.get('structured_thinking')),
                   'implementation': hashlib.sha256((backend / 'core' / 'llm_utils.py').read_bytes()).hexdigest()}
-    judge = {'enabled': bool(config.get('judge_enabled', False)),
+    judge_mode = config.get('judge_mode', 'scores')
+    if judge_mode not in ('scores', 'explained_v1'):
+        raise ValueError('Invalid Judge mode')
+    judge = {'enabled': bool(config.get('judge_enabled', False)), 'mode': judge_mode,
              'model': config.get('judge_model', config.get('model', '')),
+             'parameters': {'max_tokens': 256 if judge_mode == 'scores' else 1600, 'temperature': 0.0},
              'structured_response': structured,
              'implementation': hashlib.sha256((backend / 'evaluation' / 'evaluator.py').read_bytes()).hexdigest()}
     retrieval = {name: config.get(name, default) for name, default in
                  (('rewrite_policy', 'always'), ('rerank_policy', 'always'), ('retrieval_top_k', 5),
                   ('retrieval_timeout_s', 30.0), ('adaptive_rules_version', '1'))}
     retrieval['structured_response'] = structured
+    # This describes new imports; legacy records without a marker remain readable
+    # and are not silently re-embedded by loading an existing collection.
+    retrieval['new_knowledge_index_text_version'] = KnowledgeBase.INDEX_TEXT_VERSION
     model = {'default': config.get('model', 'unspecified'),
              'provider_endpoint': stable_hash(config.get('base_url') or 'anthropic_default'),
              'agents': {role: os.getenv(f'ECHOMIND_{role.upper()}_MODEL') or config.get('model', 'unspecified')
@@ -210,5 +219,6 @@ def build_fingerprints(dataset, config):
                             if name.startswith('ECHOMIND_') and name.endswith(('_MAX_TOKENS', '_TEMPERATURE'))}}
     return {'dataset': stable_hash(dataset), 'model': stable_hash(model),
             'prompt': stable_hash(prompt), 'skills': stable_hash(skills),
-            'knowledge': stable_hash(dataset['knowledge']), 'code': stable_hash(_tree_snapshot(backend, '*.py')),
+            'knowledge': stable_hash(dataset['knowledge']),
+            'code': stable_hash(_tree_snapshot(backend, '*.py', excluded_root_dirs=('data',))),
             'judge': stable_hash(judge), 'retrieval': stable_hash(retrieval)}

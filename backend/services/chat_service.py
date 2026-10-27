@@ -14,6 +14,9 @@ from observability.telemetry import bind_telemetry, get_telemetry
 from observability.instrumentation import bind_usage
 from observability.experiments import current_trace_metadata
 from context.memory_evidence import memory_evidence_id
+from core.intent_recognizer import IntentCategory
+from core.intent_context import normalize_archived_user_messages
+from core.request_understanding import normalize_understanding, RESOLUTION_REASONS
 
 logger = logging.getLogger(__name__)
 
@@ -85,13 +88,27 @@ class ChatService:
                     memory_context = await self.memory.get_context(user_id, conv_id, query=message)
                 history = [{'role': item.role.value, 'content': item.content}
                            for item in memory_context.recent_messages[-5:]] or None
+                intent_options = {'history': history}
+                archived = normalize_archived_user_messages(getattr(memory_context, 'handoff_user_messages', []))
+                if archived:
+                    intent_options['archived_user_messages'] = archived
                 with self._stage('intent', timings):
-                    intent = await self.orchestrator.recognize_intent(message, history=history)
+                    intent = await self.orchestrator.recognize_intent(message, **intent_options)
+                knowledge_required = getattr(intent, 'knowledge_required', False) is True
+                understanding = normalize_understanding(getattr(intent, 'request_understanding', None))
+                voted = getattr(intent, 'voted_intent', '')
+                voted = voted if isinstance(voted, str) and voted in IntentCategory._value2member_map_ else ''
+                resolution = getattr(intent, 'intent_resolution', 'legacy_vote')
+                resolution = resolution if isinstance(resolution, str) and resolution in RESOLUTION_REASONS else 'legacy_vote'
                 req = Request(message=message, user_id=user_id, conv_id=conv_id,
                               context=memory_context.to_prompt_text(), history=history,
+                              archived_user_messages=getattr(memory_context, 'handoff_user_messages', []),
                               entities=intent.entities, intent=intent.intent,
                               intent_group=intent.intent_group, urgency=intent.urgency,
-                              intent_confidence=intent.confidence)
+                              intent_confidence=intent.confidence,
+                              knowledge_required=knowledge_required,
+                              request_understanding=understanding, voted_intent=voted,
+                              intent_resolution=resolution)
                 with self._stage('orchestration', timings, kind='agent'):
                     result = await self.orchestrator.run(req)
                 with self._stage('memory_write', timings):
@@ -121,8 +138,13 @@ class ChatService:
                     'orchestrator_latency_ms': result.latency_ms,
                     'stage_latency_ms': timings,
                     'knowledge_used': 'search_knowledge_base' in result.tools_used,
+                    'knowledge_required': knowledge_required,
+                    'request_understanding': understanding, 'voted_intent': voted,
+                    'intent_resolution': resolution,
                     'entities': intent.entities, 'intent_confidence': intent.confidence,
                     'intent_source_scores': intent.source_scores,
+                    'intent_source_categories': getattr(intent, 'source_categories', {}),
+                    'intent_decision_mechanism': getattr(intent, 'decision_mechanism', 'unreported'),
                     'profile_status': profile_status,
                     'usage': usage.snapshot(),
                     'usage_scope': 'including_profile' if wait_for_profile else 'through_response',

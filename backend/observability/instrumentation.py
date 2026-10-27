@@ -67,6 +67,29 @@ def _response_usage(response: Any) -> dict[str, int]:
     return result
 
 
+def _generation_diagnostics(response: Any, max_tokens: Any) -> dict[str, Any]:
+    """Record bounded protocol facts; never include text, thinking or tool input."""
+    reason = _value(response, 'stop_reason')
+    known_reasons = {'end_turn', 'max_tokens', 'stop_sequence', 'tool_use', 'pause_turn', 'refusal'}
+    reason = reason if type(reason) is str and reason in known_reasons else (
+        'not_reported' if reason is None else 'other')
+    content = _value(response, 'content')
+    blocks = content if isinstance(content, (list, tuple)) else ()
+    known_types = {'text', 'tool_use', 'thinking', 'redacted_thinking'}
+    block_types, has_text = [], False
+    for block in blocks:
+        kind = _value(block, 'type')
+        kind = kind if type(kind) is str and kind in known_types else 'other'
+        if kind not in block_types:
+            block_types.append(kind)
+        text = _value(block, 'text') if kind == 'text' else None
+        has_text = has_text or (type(text) is str and bool(text.strip()))
+    output_tokens = _response_usage(response).get('output_tokens')
+    reached = type(max_tokens) is int and max_tokens > 0 and type(output_tokens) is int and output_tokens >= max_tokens
+    return {'stop_reason': reason, 'block_types': block_types,
+            'has_visible_text': has_text, 'max_tokens_reached': reached}
+
+
 class _MessagesProxy:
     def __init__(self, messages: Any) -> None:
         self._messages = messages
@@ -94,12 +117,25 @@ class _MessagesProxy:
                 if remaining is None:
                     response = await self._messages.create(*args, **kwargs)
                 else:
+                    if remaining <= 0:
+                        raise budget.stop('deadline')
+                    task = asyncio.current_task()
+                    cancellations_before = task.cancelling()
+                    deadline = asyncio.timeout(remaining)
                     try:
-                        response = await asyncio.wait_for(self._messages.create(*args, **kwargs), max(0, remaining))
-                    except asyncio.TimeoutError:
-                        if budget.remaining_seconds() <= 0:
+                        async with deadline:
+                            response = await self._messages.create(*args, **kwargs)
+                    except Exception:
+                        if task.cancelling() > cancellations_before:
+                            raise asyncio.CancelledError() from None
+                        if deadline.expired():
                             raise budget.stop('deadline') from None
                         raise
+                    if task.cancelling() > cancellations_before:
+                        raise asyncio.CancelledError()
+                    # A provider may swallow cancellation and return a response.
+                    if deadline.expired():
+                        raise budget.stop('deadline')
             except BaseException as error:
                 observation.update(level="ERROR", status_message=type(error).__name__)
                 raise
@@ -108,7 +144,8 @@ class _MessagesProxy:
                 for name, value in usage.items():
                     setattr(counter, name, getattr(counter, name) + value)
             observation.update(model=_value(response, "model") or kwargs.get("model"),
-                               usage_details=usage, output=_value(response, "content"))
+                               usage_details=usage, output=_value(response, "content"),
+                               metadata={'generation_diagnostics': _generation_diagnostics(response, kwargs.get('max_tokens'))})
             return response
 
 

@@ -32,6 +32,7 @@ class KnowledgeBase:
     """
 
     COLLECTION_NAME = "knowledge_base"
+    INDEX_TEXT_VERSION = 1
 
     def __init__(
         self,
@@ -85,9 +86,13 @@ class KnowledgeBase:
             for i, chunk in enumerate(chunks):
                 doc_id = ref.evidence_id(i)
                 ids.append(doc_id)
-                docs.append(chunk)
+                # Chroma embeds its stored document. Include the title in that
+                # representation, while retaining the original evidence chunk
+                # at the public search boundary. Existing records stay readable.
+                docs.append(f"{title}\n{chunk}" if title else chunk)
                 metas.append({"title": title, "chunk_index": i, "total_chunks": len(chunks),
-                              **ref.to_metadata(), "evidence_id": doc_id})
+                              **ref.to_metadata(), "evidence_id": doc_id,
+                              "index_text_version": self.INDEX_TEXT_VERSION})
 
         if ids:
             # ChromaDB 会自动生成 Embedding
@@ -127,6 +132,11 @@ class KnowledgeBase:
                 results["metadatas"][0],
                 results["distances"][0],
             ):
+                title = meta.get('title', '')
+                marker = meta.get('index_text_version')
+                prefix = f'{title}\n' if title else ''
+                if type(marker) is int and marker == 1 and prefix and doc.startswith(prefix):
+                    doc = doc[len(prefix):]
                 ref = ContextRef.from_document({**(meta or {}), 'content': doc})
                 if ref.scope not in {'public', scope} or effective_time(ref.effective_at) > cutoff:
                     continue

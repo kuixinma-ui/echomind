@@ -15,19 +15,20 @@ import hashlib
 import asyncio
 import json
 import logging
-import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import redis.asyncio as redis
 from anthropic import AsyncAnthropic
+from redis.exceptions import WatchError
 
 from core.llm_utils import extract_text_content, parse_structured_response, structured_request_options
 from context import ContextRef, profile_diff
 from memory.roles import MsgRole
+from observability.budgets import EvaluationBudgetExceeded
 from services.storage import (collection_name, create_chroma_client, memory_key,
-                              require_evaluation_namespace, validate_namespace)
+                              identity_text, require_evaluation_namespace, validate_namespace)
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ class MemoryContext:
     relevant_history: List[str]       # 情景记忆：语义相关的历史片段
     user_profile:     Dict[str, Any]  # 用户画像：偏好、常用实体
     summary:          str             # 当前会话摘要（压缩后）
+    handoff_user_messages: List[Dict[str, str]] = field(default_factory=list)
 
     @staticmethod
     def _clean(text: str) -> str:
@@ -81,6 +83,10 @@ class MemoryManager:
     HISTORY_TOP_K = 5     # 情景记忆检索返回条数
     SUMMARY_MAX_CHARS = 800
     PROFILE_DOC_PREFIX = "user_profile:"
+    HANDOFF_METADATA_KEY = "handoff_user_messages_v1"
+    HANDOFF_MAX_MESSAGES = 20
+    HANDOFF_MAX_CONTENT = 1000
+    HANDOFF_MAX_JSON = 32768
 
     def __init__(
         self,
@@ -148,8 +154,8 @@ class MemoryManager:
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         """将一条消息写入工作记忆，超阈值时自动压缩。"""
-        user_id = self._safe_text(user_id)
-        conv_id = self._safe_text(conv_id)
+        user_id = identity_text(user_id)
+        conv_id = identity_text(conv_id)
         clean_metadata = {
             self._safe_text(k): self._safe_metadata_value(v)
             for k, v in (metadata or {}).items()
@@ -178,8 +184,8 @@ class MemoryManager:
         upserts the same record; the working conversation is left intact.
         """
         from context.memory_evidence import memory_evidence_id
-        user_id, conv_id = self._safe_text(user_id), self._safe_text(conv_id)
-        messages = await self._get_working_memory(user_id, conv_id)
+        user_id, conv_id = identity_text(user_id), identity_text(conv_id)
+        messages = await self._get_working_memory(user_id, conv_id, complete=True)
         summary = await self._redis.get(self._summary_key(user_id, conv_id)) or ''
         text = '\n'.join(([f'[earlier summary] {summary}'] if summary else []) +
                          [f'{message.role.value}: {message.content}' for message in messages]).strip()
@@ -190,12 +196,13 @@ class MemoryManager:
         await asyncio.to_thread(self._episodic.upsert, ids=[document_id], documents=[text], metadatas=[{
             'user_id': user_id, 'conv_id': conv_id, 'source': 'session_archive',
             'evidence_id': evidence_id, 'ts': datetime.now().isoformat(), 'summary_inferred': bool(summary),
+            self.HANDOFF_METADATA_KEY: self._serialize_handoff_users(messages),
         }])
         return {'evidence_id': evidence_id, 'source_conv': conv_id, 'message_count': len(messages)}
 
     async def update_profile(self, user_id: str, conv_id: str) -> bool:
         """Return False on extraction/storage failure; an empty conversation is a no-op success."""
-        user_id = self._safe_text(user_id)
+        user_id, conv_id = identity_text(user_id), identity_text(conv_id)
         async with self._profile_locks.setdefault(user_id, asyncio.Lock()):
             return await self._update_profile(user_id, conv_id)
 
@@ -204,8 +211,8 @@ class MemoryManager:
         从当前工作记忆中提炼用户偏好，更新用户画像。
         用 LLM 提炼偏好，然后存入 ChromaDB（ChromaDB 内置 embedding，不依赖外部 API）。
         """
-        user_id = self._safe_text(user_id)
-        conv_id = self._safe_text(conv_id)
+        user_id = identity_text(user_id)
+        conv_id = identity_text(conv_id)
         messages = await self._get_working_memory(user_id, conv_id)
         if not messages:
             return True
@@ -247,13 +254,14 @@ class MemoryManager:
         require_evaluation_namespace(self.namespace)
         if not isinstance(profile, dict):
             raise ValueError('Profile seed must be an object')
-        user_id = self._safe_text(user_id)
+        user_id, source_conv = identity_text(user_id), identity_text(source_conv)
         async with self._profile_locks.setdefault(user_id, asyncio.Lock()):
             before = await self._get_profile(user_id)
-            return await self._write_profile(user_id, self._safe_text(source_conv), profile,
+            return await self._write_profile(user_id, source_conv, profile,
                                              before, inferred=False, experiment_seed=True)
 
     async def _write_profile(self, user_id, conv_id, profile, before, *, inferred, experiment_seed=False):
+        user_id, conv_id = identity_text(user_id), identity_text(conv_id)
         doc_id = self._profile_doc_id(user_id)
         stored = await asyncio.to_thread(self._profile.get, ids=[doc_id])
         metadata = (stored.get('metadatas') or [{}])[0] or {}
@@ -276,7 +284,7 @@ class MemoryManager:
 
     async def get_profile_audit(self, user_id: str) -> List[Dict[str, Any]]:
         """Read this user's last 10,000 profile changes in chronological order."""
-        rows = await self._redis.lrange(self._profile_audit_key(self._safe_text(user_id)), 0, 9999)
+        rows = await self._redis.lrange(self._profile_audit_key(identity_text(user_id)), 0, 9999)
         return [json.loads(row) for row in reversed(rows)]
 
     def _profile_audit_key(self, user_id: str) -> str:
@@ -291,14 +299,14 @@ class MemoryManager:
         query 用于从情景记忆中检索语义相关的历史片段。
         """
         # 1. 工作记忆（当前会话最近消息）
-        user_id = self._safe_text(user_id)
-        conv_id = self._safe_text(conv_id)
+        user_id = identity_text(user_id)
+        conv_id = identity_text(conv_id)
         query = self._safe_text(query)
 
         recent = await self._get_working_memory(user_id, conv_id)
 
         # 2. 情景记忆（跨会话语义检索）
-        history = await self._search_episodic(
+        history, handoff_users = await self._search_episodic_context(
             user_id,
             conv_id,
             query or (recent[-1].content if recent else ""),
@@ -315,24 +323,37 @@ class MemoryManager:
             relevant_history=history,
             user_profile=profile,
             summary=summary,
+            handoff_user_messages=handoff_users,
         )
 
     # ── 压缩（防止 context 爆炸）─────────────────────────────────────────────
 
-    async def _compress(self, user_id: str, conv_id: str) -> None:
+    async def _compress(self, user_id: str, conv_id: str) -> bool:
         """
         工作记忆压缩：
           1. 用 LLM 对旧消息生成摘要
-          2. 摘要存 Redis（覆盖旧摘要）
-          3. 旧消息存入情景记忆（ChromaDB）供跨会话检索
-          4. 工作记忆只保留最近 5 条
-        """
-        messages = await self._get_working_memory(user_id, conv_id)
-        if len(messages) < self.COMPRESS_AT:
-            return
+          2. 确认最早一批消息已归档，再发布摘要和裁剪工作列表
+          3. 同一 Redis WATCH/MULTI 提交，快照变化则放弃本次提交
 
-        to_compress = messages[:-5]   # 保留最近 5 条
-        keep        = messages[-5:]
+        Chroma/Redis 不构成共同事务；Redis 提交失败可能留下已确认的归档，
+        稳定批次身份允许重试。每次只处理有界前缀，积压的其余消息完整保留。
+        """
+        user_id, conv_id = identity_text(user_id), identity_text(conv_id)
+        key = self._wm_key(user_id, conv_id)
+        skey = self._summary_key(user_id, conv_id)
+        # Context reads remain bounded; compaction must see the unarchived prefix
+        # even after repeated failures grow this list beyond WORKING_MAX.
+        snapshot = list(await self._redis.lrange(key, 0, -1))
+        messages = self._working_messages(snapshot)
+        if len(messages) < self.COMPRESS_AT:
+            return False
+
+        batch_size = self.COMPRESS_AT - 5
+        if batch_size <= 0:
+            raise ValueError('Compression threshold must exceed five retained messages')
+        to_compress = messages[:batch_size]
+        # Keep None distinct from an explicitly stored empty summary for WATCH.
+        old_summary = await self._redis.get(skey)
 
         # LLM 摘要
         text = self._safe_text("\n".join(f"{m.role.value}: {m.content}" for m in to_compress))
@@ -343,34 +364,47 @@ class MemoryManager:
                 messages=[{"role": "user", "content": prompt}],
             )
             summary = self._safe_text(extract_text_content(resp.content)).strip()
+        except (EvaluationBudgetExceeded, asyncio.CancelledError):
+            raise
         except Exception:
             summary = f"对话包含 {len(to_compress)} 条消息（摘要生成失败）"
 
-        # 存摘要到 Redis
-        skey = self._summary_key(user_id, conv_id)
-        old_summary = await self._redis.get(skey) or ""
-        new_summary = await self._merge_summary(old_summary, summary)
-        await self._redis.setex(skey, 86400, new_summary)
+        new_summary = await self._merge_summary(old_summary or "", summary)
 
-        # 旧消息存入情景记忆
-        await self._store_episodic(user_id, conv_id, text, summary)
+        # A failed or cancelled archive cannot justify replacing the old summary
+        # or removing its source messages. A cancelled thread may still finish;
+        # its stable upsert identity makes a later retry reuse this batch.
+        await self._store_episodic(user_id, conv_id, text, summary, user_messages=to_compress)
 
-        # 重置工作记忆为最近 5 条
-        key = self._wm_key(user_id, conv_id)
-        await self._redis.delete(key)
-        for m in keep:
-            await self._redis.lpush(key, json.dumps({
-                "role": m.role.value, "content": m.content,
-                "ts": m.timestamp.isoformat(), "metadata": m.metadata,
-            }))
-        await self._redis.expire(key, 86400)
+        try:
+            async with self._redis.pipeline(transaction=True) as pipe:
+                await pipe.watch(key, skey)
+                if (await pipe.lrange(key, 0, -1) != snapshot
+                        or await pipe.get(skey) != old_summary):
+                    logger.info('工作记忆压缩暂缓：源快照已变化')
+                    return False
+                pipe.multi()
+                pipe.setex(skey, 86400, new_summary)
+                # Redis lists are newest first. Only remove the archived oldest
+                # prefix; do not reconstruct or drop a newer unarchived backlog.
+                pipe.ltrim(key, 0, len(snapshot) - len(to_compress) - 1)
+                pipe.expire(key, 86400)
+                await pipe.execute()
+        except WatchError:
+            logger.info('工作记忆压缩暂缓：提交期间源快照已变化')
+            return False
         logger.info(f"工作记忆压缩完成: {user_id}/{conv_id}，摘要 {len(summary)} 字")
+        return True
 
     # ── 内部辅助 ──────────────────────────────────────────────────────────────
 
-    async def _get_working_memory(self, user_id: str, conv_id: str) -> List[Message]:
+    async def _get_working_memory(self, user_id: str, conv_id: str, *, complete: bool = False) -> List[Message]:
         key  = self._wm_key(user_id, conv_id)
-        raws = await self._redis.lrange(key, 0, self.WORKING_MAX - 1)
+        raws = await self._redis.lrange(key, 0, -1 if complete else self.WORKING_MAX - 1)
+        return self._working_messages(raws)
+
+    @staticmethod
+    def _working_messages(raws) -> List[Message]:
         msgs = []
         for raw in reversed(raws):  # Redis lpush 最新在前，reversed 还原时序
             d = json.loads(raw)
@@ -384,46 +418,118 @@ class MemoryManager:
 
     async def _search_episodic(self, user_id: str, conv_id: str, query: str) -> List[str]:
         """语义检索情景记忆。ChromaDB 内置 embedding，不依赖外部 API。"""
+        history, _ = await self._search_episodic_context(user_id, conv_id, query)
+        return history
+
+    async def _search_episodic_context(self, user_id: str, conv_id: str, query: str):
+        """Use the same selected documents for recall and typed handoff provenance."""
         query_text = self._safe_text(query).strip()
         if not query_text:
-            return []
+            return [], []
         try:
             results = await self._query_episodic(
                 query_text,
                 n_results=self.HISTORY_TOP_K,
-                where={"$and": [{"user_id": self._safe_text(user_id)}, {"conv_id": self._safe_text(conv_id)}]},
+                where={"$and": [{"user_id": identity_text(user_id)}, {"conv_id": identity_text(conv_id)}]},
             )
-            docs = self._extract_docs(results)
-            if len(docs) < self.HISTORY_TOP_K:
+            rows = self._episodic_rows(results)
+            if len(rows) < self.HISTORY_TOP_K:
                 fallback = await self._query_episodic(
                     query_text,
                     n_results=self.HISTORY_TOP_K,
-                    where={"user_id": self._safe_text(user_id)},
+                    where={"user_id": identity_text(user_id)},
                 )
-                docs.extend(self._extract_docs(fallback))
-            return self._dedupe_texts(docs)[: self.HISTORY_TOP_K]
+                rows.extend(self._episodic_rows(fallback))
+            history, handoff_users, seen = [], [], set()
+            for document, metadata in rows:
+                text = document.strip()
+                if text in seen:
+                    continue
+                seen.add(text)
+                history.append(text)
+                handoff_users.extend(self._read_handoff_users(metadata, user_id, text))
+                if len(history) >= self.HISTORY_TOP_K:
+                    break
+            return history, handoff_users
         except Exception as ex:
             logger.warning(f"情景记忆检索失败: {ex}")
-            return []
+            return [], []
 
-    async def _store_episodic(self, user_id: str, conv_id: str, text: str, summary: str) -> None:
-        """将压缩后的对话片段存入情景记忆。ChromaDB 内置 embedding，不依赖外部 API。"""
+    async def _store_episodic(self, user_id: str, conv_id: str, text: str, summary: str,
+                              *, user_messages: Optional[List[Message]] = None) -> None:
+        """Confirm an idempotent archive upsert; storage failures propagate."""
+        user_id = identity_text(user_id)
+        conv_id = identity_text(conv_id)
+        text = self._safe_text(text)
+        summary = self._safe_text(summary)
+        identity = [user_id, conv_id, text, [
+            [message.role.value, message.timestamp.isoformat()]
+            for message in user_messages or [] if isinstance(message, Message)
+        ]]
+        doc_id = 'compression_' + hashlib.sha256(json.dumps(identity, ensure_ascii=True).encode()).hexdigest()
+        # The generated summary is intentionally not part of batch identity:
+        # retries can produce different summaries for the same original batch.
+        await asyncio.to_thread(
+            self._episodic.upsert,
+            ids=[doc_id],
+            documents=[summary],
+            metadatas=[{"user_id": user_id, "conv_id": conv_id,
+                        "ts": datetime.now().isoformat(), "full_text": self._safe_text(text[:500]),
+                        "source": "conversation_compression",
+                        self.HANDOFF_METADATA_KEY: self._serialize_handoff_users(user_messages or [])}],
+        )
+
+    @classmethod
+    def _serialize_handoff_users(cls, messages: List[Message]) -> str:
+        # Message.metadata and rendered text never establish a role.
+        records = [{'role': 'user', 'content': cls._safe_text(message.content)[:cls.HANDOFF_MAX_CONTENT]}
+                   for message in messages if isinstance(message, Message) and message.role == MsgRole.USER]
+        records = records[-cls.HANDOFF_MAX_MESSAGES:]
+        encoded = json.dumps(records, ensure_ascii=False)
+        while len(encoded) > cls.HANDOFF_MAX_JSON and records:
+            records.pop(0)
+            encoded = json.dumps(records, ensure_ascii=False)
+        return encoded
+
+    @staticmethod
+    def _episodic_rows(results: Dict[str, Any]):
+        documents = results.get('documents') or []
+        metadatas = results.get('metadatas') or []
+        documents = documents[0] if documents and isinstance(documents[0], list) else documents
+        metadatas = metadatas[0] if metadatas and isinstance(metadatas[0], list) else metadatas
+        return [(document, metadatas[index] if index < len(metadatas) else None)
+                for index, document in enumerate(documents)
+                if isinstance(document, str) and document.strip()]
+
+    @classmethod
+    def _read_handoff_users(cls, metadata, user_id, document):
+        from context.memory_evidence import memory_evidence_id
+        if not isinstance(metadata, dict) or metadata.get('user_id') != identity_text(user_id):
+            return []
+        if metadata.get('source') not in {'session_archive', 'conversation_compression'}:
+            return []
+        source_conv = metadata.get('conv_id')
+        if not isinstance(source_conv, str) or not source_conv.strip() or len(source_conv) > 256:
+            return []
+        evidence_id = memory_evidence_id(document)
+        if metadata.get('evidence_id', evidence_id) != evidence_id:
+            return []
+        encoded = metadata.get(cls.HANDOFF_METADATA_KEY)
+        if not isinstance(encoded, str) or len(encoded) > cls.HANDOFF_MAX_JSON:
+            return []
         try:
-            user_id = self._safe_text(user_id)
-            conv_id = self._safe_text(conv_id)
-            text = self._safe_text(text)
-            summary = self._safe_text(summary)
-            doc_id = hashlib.md5(f"{user_id}{conv_id}{time.time()}".encode()).hexdigest()
-            # 直接传 documents，ChromaDB 内置模型自动生成 embedding
-            await asyncio.to_thread(
-                self._episodic.add,
-                ids=[doc_id],
-                documents=[summary],
-                metadatas=[{"user_id": user_id, "conv_id": conv_id,
-                            "ts": datetime.now().isoformat(), "full_text": self._safe_text(text[:500])}],
-            )
-        except Exception as ex:
-            logger.warning(f"存储情景记忆失败: {ex}")
+            records = json.loads(encoded)
+        except (ValueError, RecursionError):
+            return []
+        if not isinstance(records, list) or len(records) > cls.HANDOFF_MAX_MESSAGES:
+            return []
+        if any(not isinstance(record, dict) or set(record) != {'role', 'content'}
+               or record.get('role') != 'user'
+               or not isinstance(record.get('content'), str)
+               or len(record['content']) > cls.HANDOFF_MAX_CONTENT for record in records):
+            return []
+        return [{'role': 'user', 'content': record['content'], 'source_conv': source_conv,
+                 'evidence_id': evidence_id} for record in records if record['content'].strip()]
 
     async def _get_profile(self, user_id: str) -> Dict[str, Any]:
         """获取用户画像（取最新一条）。"""
@@ -544,6 +650,8 @@ class MemoryManager:
             merged = self._safe_text(extract_text_content(resp.content)).strip()
             if merged:
                 return merged[: self.SUMMARY_MAX_CHARS]
+        except (EvaluationBudgetExceeded, asyncio.CancelledError):
+            raise
         except Exception as ex:
             logger.warning(f"合并摘要失败，回退为截断拼接: {ex}")
 

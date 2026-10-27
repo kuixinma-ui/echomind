@@ -24,6 +24,7 @@ from fastapi import FastAPI, HTTPException, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
+from services.storage import identity_text
 
 load_dotenv()
 
@@ -157,6 +158,8 @@ class ChatResponse(BaseModel):
     entities: Dict[str, List[str]] = Field(default_factory=dict)
     intent_confidence: float = 0.0
     intent_source_scores: Dict[str, float] = Field(default_factory=dict)
+    intent_source_categories: Dict[str, str] = Field(default_factory=dict)
+    intent_decision_mechanism: str = ""
     orchestrator_latency_ms: float = 0.0
     stage_latency_ms: Dict[str, float] = Field(default_factory=dict)
     tool_traces: List[Dict[str, Any]] = Field(default_factory=list)
@@ -164,6 +167,10 @@ class ChatResponse(BaseModel):
     usage: Dict[str, int] = Field(default_factory=dict)
     usage_scope: str = "through_response"
     memory_evidence_ids: List[str] = Field(default_factory=list)
+    knowledge_required: bool = False
+    request_understanding: Dict[str, Any] = Field(default_factory=dict)
+    voted_intent: str = ""
+    intent_resolution: str = "legacy_vote"
 
 
 class ToolTraceResponse(BaseModel):
@@ -209,10 +216,13 @@ async def chat(req: ChatRequest):
     主对话接口。完整流程：
       记忆读取 → 意图识别 → Agent 路由 → 执行 → 记忆写入
     """
-    if _chat_service is None:
-        raise HTTPException(503, "服务未就绪")
     try:
-        return await _chat_service.chat(req.message, req.user_id, req.conv_id)
+        # Do not echo invalid Unicode through Pydantic's default error payload.
+        user_id = identity_text(req.user_id)
+        conv_id = None if req.conv_id is None else identity_text(req.conv_id)
+        if _chat_service is None:
+            raise HTTPException(503, "服务未就绪")
+        return await _chat_service.chat(req.message, user_id, conv_id)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 
@@ -550,7 +560,8 @@ async def run_scenarios(body: Optional[ScenarioRunInput] = None):
         from observability.instrumentation import AnthropicClientProxy
         judge_client = AnthropicClientProxy(AsyncAnthropic(**{key: cfg[key] for key in ('api_key', 'base_url') if cfg.get(key)}))
         try:
-            runner = ScenarioRunner(_isolated_runtime, judge=LLMJudge(judge_client, config['judge_model']), telemetry=get_telemetry())
+            judge_options = {'mode': config['judge_mode']} if config.get('judge_mode', 'scores') != 'scores' else {}
+            runner = ScenarioRunner(_isolated_runtime, judge=LLMJudge(judge_client, config['judge_model'], **judge_options), telemetry=get_telemetry())
             report = await runner.run(dataset, metadata=metadata)
         finally:
             await judge_client.close()

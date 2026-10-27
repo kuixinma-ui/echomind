@@ -199,12 +199,26 @@ def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
                 "reranked": False,
             }
 
+        # MCP fallbacks contain operational guidance, not retrieved policy.
+        # Do not present their text or identifiers as knowledge evidence.
+        rows = result.data
+        fallback_rows = [row for row in rows if isinstance(row, dict) and row.get("fallback") is True] if isinstance(rows, list) else []
+        if fallback_rows:
+            rows = [row for row in rows if not (isinstance(row, dict) and row.get("fallback") is True)]
+            if not rows:
+                return {
+                    "success": False, "query": query, "results": [],
+                    "error": "知识检索已降级，未取得可核验的政策来源", "fallback": True,
+                    "reranked": False,
+                }
+
         return {
             "success": True,
             "query": query,
             "top_k": top_k,
-            "results": result.data,
+            "results": rows,
             "reranked": bool(getattr(result, "reranked", False)),
+            "cached": bool(getattr(result, "cached", False)),
         }
 
     return {

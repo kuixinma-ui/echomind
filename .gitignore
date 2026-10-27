@@ -35,3 +35,10 @@ backend/evaluation/reports/
 Thumbs.db
 *.swp
 *.bak
+
+# Local project coordination, plans, handoff notes and execution evidence
+/AGENTS.md
+/docs/CONTINUE_HERE.md
+/docs/acceptance.md
+/docs/superpowers/
+/docs/evidence/

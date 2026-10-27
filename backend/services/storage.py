@@ -21,9 +21,25 @@ def collection_name(namespace, base):
     return f'{namespace}_{base}' if namespace else base
 
 
+def identity_text(value):
+    """Keep identity text lossless; content sanitization must not merge owners."""
+    text = '' if value is None else str(value)
+    try:
+        text.encode('utf-8')
+    except UnicodeEncodeError:
+        raise ValueError('Memory identity must use valid Unicode') from None
+    return text
+
+
 def memory_key(namespace, kind, user_id, conv_id):
+    user_text, conv_text = identity_text(user_id), identity_text(conv_id)
     if not namespace:
-        return f'{kind}:{user_id}:{conv_id}'
+        if (':' in user_text or ':' in conv_text) and not (kind == 'profile_audit' and conv_text == ''):
+            # Old delimiter keys cannot establish which identity owns their data.
+            # Use a disjoint prefix and never fall back to ambiguous legacy keys.
+            identity = hashlib.sha256(json.dumps([user_text, conv_text], ensure_ascii=True).encode()).hexdigest()
+            return f'{kind}_v2:{identity}'
+        return f'{kind}:{user_text}:{conv_text}'
     identity = hashlib.sha256(json.dumps([user_id, conv_id], ensure_ascii=True).encode()).hexdigest()
     return f'{namespace}:{kind}:{identity}'
 

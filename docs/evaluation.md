@@ -1,6 +1,6 @@
 # 场景评测与上下文实验
 
-升级入口是工作台的“评测”，执行计划及逐项记录在 [执行计划](superpowers/plans/2026-10-26-scenario-evaluation-upgrade.md) 和 [执行记录](superpowers/plans/2026-10-26-scenario-evaluation-progress.md)。
+入口是工作台顶部的“评测”。先校验场景数据，再显式回放模型；查看失败后修改一个实验因素，用相同场景比较调优前后的结果。
 
 ## 三种验证口径
 
@@ -58,6 +58,53 @@ Push-Location backend
 `--mode live` 明确授权当前命令调用配置的模型；`--judge` 另启语义裁判。默认最多回放五条；可用 `--limit 120` 或重复 `--scenario <分组>` 明确扩展。省略 Judge 的语义断言记为 invalid，不能显示通过。API/工作台选择 live 时会运行证据 Judge。
 
 模型变化实验建议固定 `ECHOMIND_JUDGE_MODEL`，避免裁判同时变化。模型服务需要支持 Anthropic Messages 协议。
+
+## 可解释Judge与固定回复诊断
+
+默认 `ECHOMIND_JUDGE_MODE=scores` 保留旧四分数协议。显式选择 `explained_v1`（或场景CLI的 `--judge-mode explained_v1`）会要求每维同时返回criterion、简短reason、输入证据ID和missing清单；四个分数和原通过门槛不变。解释缺字段、越界、未知证据ID或无效JSON都会记invalid，不能补默认分。输出上限由256变为1600，模式与预算、实际实现均进入Judge指纹；两种裁判不能混作同条件结果。
+
+校准工具可只消费已保存的回复，默认离线验证，不创建客服Runtime/Redis/Chroma，也不重新生成客服回答：
+
+```powershell
+# backend目录；source-batch需含完整manifest、dataset与分组原报告
+..\.venv-integration\Scripts\python.exe -m evaluation.judge_calibration --source-batch data/eval/batches/repair_acceptance_20261027_01
+```
+
+输出包含固定输入、原报告hash/评分引用和快照hash。默认最多12个semantic断言；更大源批次需重复 `--case CASE_ID` 显式选择。缺失源回复仍在分母中记source_unavailable。只有摘要的环境不具备完整原始批次，应迁移完整批次目录或从新实验产生真实报告。
+
+在已配置模型的本机.env.integration中显式发起Judge-only调用（会产生模型费用）：
+
+```powershell
+..\.venv-integration\Scripts\python.exe -m evaluation.judge_calibration --source-batch data/eval/batches/repair_acceptance_20261027_01 --mode live --env-file .env.integration --output-dir data/eval/calibrations/my-explained-run --max-model-calls 12 --max-model-seconds 600 --max-workers 2
+```
+
+输出目录必须不存在；已有或中断目录不会自动再次收费。每项只评一次，已返回用量在格式错误时也保留；SDK内部HTTP重试不单独计数。结果是新裁判对固定回复的诊断，解释仍需人工审定，不代表客服准确率提升，不覆盖原报告或baseline。ScenarioRunner仍按四维逐一达标；兼容的旧EndToEndEvaluator保留原overall门槛。
+
+## 有界分组与断点续跑
+
+`evaluation.batch_runner` 默认仅离线校验。显式 live 时按场景分组，最多两组同时执行，每组默认最多 200 次 SDK create 尝试、1200 秒模型等待；Judge 和画像也计数。SDK 内部 HTTP 重试不单独计数，初始化/存储/清理不受整体墙钟硬超时保证，这些限制不等于金额硬上限。
+
+在 backend 目录、已完成本机 `.env.integration` 配置与服务预检后，先执行首组（会调用真实模型）：
+
+```powershell
+..\.venv-integration\Scripts\python.exe -c "from dotenv import load_dotenv; load_dotenv('.env.integration', override=True); from evaluation.batch_runner import main; raise SystemExit(main())" --mode live --dataset evaluation/datasets/customer_service_v1_1_candidate.json --batch-dir data/eval/batches/my-candidate-batch --scenario basic_routing --max-workers 2 --judge
+```
+
+检查首组后恢复剩余分组，沿用相同数据、代码、模型、裁判、Skills、知识、检索策略和预算：
+
+```powershell
+..\.venv-integration\Scripts\python.exe -c "from dotenv import load_dotenv; load_dotenv('.env.integration', override=True); from evaluation.batch_runner import main; raise SystemExit(main())" --mode live --dataset evaluation/datasets/customer_service_v1_1_candidate.json --resume data/eval/batches/my-candidate-batch --max-workers 2 --judge
+```
+
+批次保存完整 dataset 副本、manifest、各组报告及校验哈希，使用独占锁和原子写入。断言失败或预算中断的组也视为已执行，恢复时不会自动再次收费回放。代码/配置指纹变化会在新模型调用前拒绝恢复；运行中丢失进程、遗留锁或 started/blocked 组需先调查，不自动猜测是否已付费或删除锁。
+
+可离线核对完整覆盖与缓存报告，无需原模型密钥：
+
+```powershell
+..\.venv-integration\Scripts\python.exe -m evaluation.batch_runner --aggregate data/eval/batches/my-candidate-batch
+```
+
+汇总始终保留全部 120 条候选的主分母，pending/blocked 单列。`completed` 仅表示所有组已归档；通过、失败、invalid、timeout、error、hard_fail、预算中断和清理证据需分别检查。批次报告位于 `data/eval/batches`，不会自动进入现有工作台 `data/eval/scenarios` 历史列表或提升基线。运行目录中的临时 Python 驱动不再影响 code 指纹，实际应用源码和 Skill 资源仍纳入快照。
 
 ## API 与报告
 

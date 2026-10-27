@@ -131,6 +131,7 @@ def runtime_config_from_env():
         'base_url': os.getenv('ANTHROPIC_BASE_URL') or None,
         'model': os.getenv('ANTHROPIC_MODEL', 'claude-3-5-sonnet-20241022'),
         'judge_model': os.getenv('ECHOMIND_JUDGE_MODEL') or os.getenv('ANTHROPIC_MODEL', 'claude-3-5-sonnet-20241022'),
+        'judge_mode': os.getenv('ECHOMIND_JUDGE_MODE', 'scores'),
         'structured_thinking': structured_thinking_policy(),
         'redis_url': os.getenv('REDIS_URL', 'redis://redis:6379/0'),
         'chroma_host': os.getenv('CHROMA_HOST', 'chromadb'),

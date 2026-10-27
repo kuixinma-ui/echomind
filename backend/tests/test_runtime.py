@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import sys
 import threading
@@ -11,25 +12,55 @@ class Redis:
     def __init__(self):
         self.values = {}
         self.closed = False
+        self._versions = {}
+
+    def _touch(self, key):
+        self._versions[key] = self._versions.get(key, 0) + 1
+
+    @staticmethod
+    def _range(values, start, end):
+        first = start if start >= 0 else max(0, len(values) + start)
+        last = end if end >= 0 else len(values) + end
+        return values[first:last + 1] if last >= first else []
 
     async def lpush(self, key, value):
         self.values.setdefault(key, []).insert(0, value)
+        self._touch(key)
 
     async def expire(self, key, ttl):
-        pass
+        if key in self.values:
+            self._touch(key)
+            return True
+        return False
 
     async def llen(self, key):
         return len(self.values.get(key, []))
 
     async def lrange(self, key, start, end):
-        return self.values.get(key, [])[start:end + 1]
+        return self._range(self.values.get(key, []), start, end)
+
+    async def ltrim(self, key, start, end):
+        if key in self.values:
+            self.values[key] = self._range(self.values[key], start, end)
+            self._touch(key)
+        return True
+
+    async def setex(self, key, ttl, value):
+        self.values[key] = value
+        self._touch(key)
+        return True
+
+    def pipeline(self, transaction=True):
+        return RedisPipeline(self, transaction=transaction)
 
     async def get(self, key):
         return self.values.get(key)
 
     async def delete(self, *keys):
         for key in keys:
-            self.values.pop(key, None)
+            if key in self.values:
+                self.values.pop(key)
+                self._touch(key)
 
     async def scan_iter(self, match):
         for key in list(self.values):
@@ -38,6 +69,86 @@ class Redis:
 
     async def aclose(self):
         self.closed = True
+
+
+class RedisPipeline:
+    """Public WATCH/MULTI protocol without a Redis service or network claims.
+
+    Queued commands run without asyncio yields. Like Redis EXEC, a command
+    error does not roll back earlier commands; failure-injection tests exercise
+    the boundary before EXEC rather than claiming arbitrary server rollback.
+    """
+
+    def __init__(self, redis, *, transaction=True):
+        self.redis = redis
+        self.transaction = transaction
+        self.watched = {}
+        self.commands = []
+        self.in_multi = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        await self.reset()
+
+    async def reset(self):
+        self.watched.clear()
+        self.commands.clear()
+        self.in_multi = False
+
+    async def watch(self, *keys):
+        for key in keys:
+            self.watched[key] = (self.redis._versions.get(key, 0), copy.deepcopy(self.redis.values.get(key)))
+        return True
+
+    async def get(self, key):
+        return await self.redis.get(key)
+
+    async def lrange(self, key, start, end):
+        return await self.redis.lrange(key, start, end)
+
+    def multi(self):
+        self.in_multi = True
+
+    def setex(self, key, ttl, value):
+        self.commands.append(('setex', key, ttl, value))
+        return self
+
+    def ltrim(self, key, start, end):
+        self.commands.append(('ltrim', key, start, end))
+        return self
+
+    def expire(self, key, ttl):
+        self.commands.append(('expire', key, ttl))
+        return self
+
+    async def execute(self):
+        from redis.exceptions import WatchError
+        if any(version != self.redis._versions.get(key, 0) or value != self.redis.values.get(key)
+               for key, (version, value) in self.watched.items()):
+            raise WatchError('watched in-memory key changed')
+        if not self.in_multi or not self.transaction:
+            raise AssertionError('expected explicit MULTI transaction')
+        results = []
+        for command in self.commands:
+            kind, key, *args = command
+            try:
+                if kind == 'setex':
+                    self.redis.values[key] = args[1]
+                elif kind == 'ltrim':
+                    if key in self.redis.values:
+                        self.redis.values[key] = self.redis._range(self.redis.values[key], *args)
+                elif kind != 'expire':
+                    raise AssertionError('unsupported in-memory Redis command')
+                self.redis._touch(key)
+                results.append(True)
+            except Exception as error:
+                results.append(error)
+        for result in results:
+            if isinstance(result, Exception):
+                raise result
+        return results
 
 
 class Collection:

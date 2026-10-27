@@ -2,11 +2,7 @@
 
 推荐本机 Docker Compose。Redis/Chroma 的连接、TTL、持久化和隔离需要真实服务验证；Langfuse 再单独验收 trace/score 入库与读回。分阶段启动能缩小故障范围，所有测试数据留在独立项目和数据卷中。[Langfuse 官方 Compose 指南](https://langfuse.com/self-hosting/deployment/docker-compose)也将 Compose 定位为本地试用入口。
 
-当前本机已经完成Docker/WSL准备，8个独立服务healthy，真实存储/默认embedding/Langfuse读回及3条端到端smoke通过。证据与范围见[真实联调结果](superpowers/plans/2026-10-26-live-integration-results.md)。以下命令用于复现环境；本指南不自动接受协议或重启系统。
-
-项目内另有 Python 3.11 的 `.venv-integration`，已使用对应的 Windows 预编译包安装固定 Chroma/Langfuse 依赖；它不替代原 Python 3.12 `.venv`，也不代表 Redis、Chroma HTTP 或 Langfuse 平台已启动。
-
-已临时启动并停止原生Chroma HTTP服务，完成一次显式向量的基础回环；这不等于Compose部署验收。完整结果与额外脚本的状态码断言问题见 [补测记录](superpowers/plans/2026-10-26-chroma-http-check.md)。Redis和Langfuse平台仍待服务就绪。
+以下命令用于创建和验证本机联调环境；本指南不自动接受协议或重启系统。Windows 使用 Chroma0.5.23 时建议为联调单独创建 Python3.11 的 `.venv-integration`，避免依赖本机其他项目的环境。服务是否就绪以本次实际连接和读回结果为准。
 
 ## 1. 文件与隔离范围
 
@@ -40,7 +36,7 @@ Langfuse 配置参考已拉取的官方仓库提交 `0e024ca8eae1da68f08514a46ed
 以下 PowerShell 命令从项目发布目录执行。生成过程只写入被忽略的文件，不显示密码，也不会覆盖已有配置：
 
 ```powershell
-Set-Location D:\project\echomind\github-release\EchoMind\backend
+Set-Location backend
 @'
 from pathlib import Path
 import secrets
@@ -159,18 +155,18 @@ Langfuse 没有默认管理员账号；首次注册/项目创建由使用者在�
 & $py -m evaluation.integration --env-file .env.integration --stage langfuse
 ```
 
-该探针的usage2/3是合成传输夹具，不代表真实模型用量。默认仅允许本机/Compose端点；没有双key或显式BASE_URL时blocked，不回退Cloud。Langfuse4.70默认events_only，读回使用observations v2和scores v3；旧GET API的404不能当作未落库。参数与源码依据见[平台准备文档](superpowers/plans/2026-10-26-langfuse-readback-prep.md)。
+该探针的usage2/3是合成传输夹具，不代表真实模型用量。默认仅允许本机/Compose端点；没有双key或显式BASE_URL时blocked，不回退Cloud。Langfuse4.70默认events_only，读回使用observations v2和scores v3；旧GET API的404不能当作未落库。
 
 ### 可选：无UI本地项目初始化
 
-本机本轮使用了headless测试项目，只初始化本地组织、项目和key。`.env.integration` 已有匹配的 `LANGFUSE_INIT_ORG_ID`、`LANGFUSE_INIT_PROJECT_ID`、`LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY`，可以直接复用。新的独立环境须生成自己的ID/key；不得提交这些值，也不要将已有其他项目的key重新分配给新ID。
+headless配置只初始化本地组织、项目和key。需在 `.env.integration` 中设置匹配的 `LANGFUSE_INIT_ORG_ID`、`LANGFUSE_INIT_PROJECT_ID`、`LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY`。新环境可在仓库根运行 `python backend/scripts/prepare_integration.py` 生成自己的本地配置，已有文件不会覆盖。不得提交这些值，也不要将已有其他项目的key重新分配给新ID。
 
 ```powershell
 docker compose --env-file .env.integration -f compose.integration.yml -f compose.langfuse-headless.yml --profile langfuse config --quiet
 docker compose --env-file .env.integration -f compose.integration.yml -f compose.langfuse-headless.yml --profile langfuse up -d --wait
 ```
 
-初始化变量、key格式与幂等边界在平台准备文档中说明。这个模式不提供UI登录用户；如需界面查看，另配置本地用户。web/worker的健康检查使用实际监听的容器HOSTNAME，Compose中以 `$$` 转义；单纯检查容器内127.0.0.1会出现假不健康。
+这个模式不提供UI登录用户；如需界面查看，另配置本地用户。web/worker的健康检查使用实际监听的容器HOSTNAME，Compose中以 `$$` 转义；单纯检查容器内127.0.0.1会出现假不健康。
 
 ## 6. 停止与保留证据
 
@@ -190,4 +186,4 @@ docker compose --env-file .env.integration -f compose.integration.yml --profile 
 | 单模型请求 | 当前端点、凭据与模型组合可响应 | 多轮工具链与 Judge 质量 |
 | 1–3 条完整链路 | 有限合成场景链路与观测证据 | 120 条全量通过及业务专家审核 |
 
-本机已完成Compose原生解析、依赖镜像拉取/启动/健康及真实Langfuse平台验证；可选app镜像尚未构建，不能据本机Python3.11结果宣称其Linux构建通过。后续结果归入[真实联调执行计划](superpowers/plans/2026-10-26-live-integration-plan.md)。
+每个环境分别记录Compose解析、镜像拉取、启动健康及真实平台读回结果。可选app镜像也需要独立构建验证，不能用宿主机Python测试代替Linux镜像构建。
