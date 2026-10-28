@@ -1,4 +1,4 @@
-# EchoMind Python Backend
+# mas-agent Python Backend
 
 FastAPI 入口为 `api/main.py`，对话链路包含意图识别、ChromaDB 知识检索、多 Agent 路由和 Redis/ChromaDB 记忆。
 

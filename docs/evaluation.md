@@ -156,7 +156,7 @@ Push-Location backend
 
 使用 `langfuse==5.0.4`，Python 至少 3.11，Langfuse 自托管服务至少 4.59.0；本次参考源码为 4.70.0。设置 `ECHOMIND_TELEMETRY_ENABLED=true`、`LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY`、`LANGFUSE_BASE_URL` 后启用。
 
-完整请求包含 memory、intent、routing、Agent、LLM、tool、retrieval/rerank 子观测。场景通过 run_id/case_id 和任务评分关联。实验报告及配对比较仍由 EchoMind 保存；当前接入重点是观测与评分导出，不会自动将本地数据集同步成 Langfuse hosted dataset。
+完整请求包含 memory、intent、routing、Agent、LLM、tool、retrieval/rerank 子观测。场景通过 run_id/case_id 和任务评分关联。实验报告及配对比较仍由 mas-agent 保存；当前接入重点是观测与评分导出，不会自动将本地数据集同步成 Langfuse hosted dataset。
 
 默认不导出正文，用户/会话标识使用 HMAC；设置稳定的 `ECHOMIND_TELEMETRY_HASH_SALT` 以便跨进程关联。只有 `ECHOMIND_TRACE_CONTENT=true` 才允许正文导出，直接标识和凭据仍脱敏。SDK 缺失、导出或 flush 异常均不影响客服结果。应用退出会 shutdown exporter，短命脚本应 flush。
 

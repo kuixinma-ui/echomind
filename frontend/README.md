@@ -1,6 +1,6 @@
-# EchoMind Frontend
+# mas-agent Frontend
 
-面向 EchoMind Python API 的 Vue 3 工作台，提供对话、Agent 路由与工具轨迹查看、知识库检索与导入、Skills 管理和评测结果展示。
+面向 mas-agent Python API 的 Vue 3 工作台，提供对话、Agent 路由与工具轨迹查看、知识库检索与导入、Skills 管理和评测结果展示。
 
 ## 本地开发
 

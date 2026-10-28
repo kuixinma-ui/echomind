@@ -1,4 +1,4 @@
-# Prometheus 配置文件 — EchoMind 智能客服系统
+# Prometheus 配置文件 — mas-agent 智能客服系统
 
 global:
   scrape_interval: 15s
@@ -11,7 +11,7 @@ rule_files:
   - "alerts/*.yml"
 
 scrape_configs:
-  # EchoMind 主应用指标
+  # mas-agent 主应用指标
   - job_name: 'echomind-app'
     static_configs:
       - targets: ['echomind:8000']

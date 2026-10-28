@@ -1,4 +1,4 @@
-# EchoMind 智能客服系统 — Docker Compose 服务编排
+# mas-agent 智能客服系统 — Docker Compose 服务编排
 # 三级记忆架构：Redis（工作记忆）+ ChromaDB（情景记忆 + 用户画像）
 
 services:
@@ -67,7 +67,7 @@ services:
       retries: 3
       start_period: 10s
 
-  # ── EchoMind 主应用 ─────────────────────────────────────────────────────────
+  # ── mas-agent 主应用 ────────────────────────────────────────────────────────
   echomind:
     build:
       context: .

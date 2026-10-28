@@ -1,7 +1,7 @@
 """
-EchoMind 智能客服系统 — FastAPI 入口
+mas-agent 智能客服系统 — FastAPI 入口
 
-启动时打印小熊饼干图案。
+启动时打印项目名称与版本。
 所有核心组件在 lifespan 中初始化，通过环境变量配置。
 """
 import asyncio
@@ -34,13 +34,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BANNER = r"""
-    ʕ•ᴥ•ʔ  ʕ•ᴥ•ʔ  ʕ•ᴥ•ʔ
-   ╔══════════════════════╗
-   ║   EchoMind  v2.0     ║
-   ║   智能客服 AI 系统    ║
-   ╚══════════════════════╝
-    ʕ•ᴥ•ʔ  ʕ•ᴥ•ʔ  ʕ•ᴥ•ʔ
+BANNER = """
+    mas-agent v2.0
+    智能客服系统
 """
 
 # ── 全局组件（lifespan 中初始化）─────────────────────────────────────────────
@@ -93,7 +89,7 @@ async def lifespan(app: FastAPI):
             prometheus_port=int(os.getenv("PROMETHEUS_PORT", "0")) or None,
         )
         await _monitor.start()
-        logger.info("EchoMind ready")
+        logger.info("mas-agent ready")
         yield
     finally:
         try:
@@ -118,7 +114,7 @@ async def _isolated_runtime(*, namespace, knowledge_documents=None):
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="EchoMind 智能客服",
+    title="mas-agent · 智能客服",
     version="2.0.0",
     lifespan=lifespan,
     docs_url="/docs",
@@ -597,7 +593,7 @@ async def compare_eval_runs(body: CompareRunInput):
 # ── 交互式 CLI ────────────────────────────────────────────────────────────────
 async def _cli():
     print(BANNER)
-    print("EchoMind CLI — 输入 quit 退出\n")
+    print("mas-agent CLI — 输入 quit 退出\n")
 
     from agents.agent_orchestrator import AgentOrchestrator, Request
     from memory.conversation_memory import MemoryManager, MsgRole
@@ -648,7 +644,7 @@ async def _cli():
         await mem.add_message(user_id, conv_id, MsgRole.USER, msg)
         await mem.add_message(user_id, conv_id, MsgRole.ASSISTANT, result.response)
 
-        print(f"\nEchoMind [{result.agent_type.value}]: {result.response}\n")
+        print(f"\nmas-agent [{result.agent_type.value}]: {result.response}\n")
 
     await mem.close()
 

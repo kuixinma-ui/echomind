@@ -52,7 +52,7 @@ class KnowledgeBase:
         # 默认EF首次实际add/query可能下载模型；heartbeat并不能验证embedding可用。
         self._collection = self._client.get_or_create_collection(
             name=collection_name,
-            metadata={"description": "EchoMind RAG 知识库"},
+            metadata={"description": "mas-agent RAG 知识库"},
         )
 
         # 如果知识库为空，导入默认文档
